@@ -283,8 +283,7 @@ def cargo_table(extracted_by_doc: dict) -> pd.DataFrame:
     return df
 
 
-def style_shipment(df: pd.DataFrame) -> pd.io.formats.style.Styler:
-    sty = df.style
+def style_shipment(df: pd.DataFrame) :
 
     for col in df.columns:
         sty = sty.applymap(lambda _: f"background-color: {DOC_COLORS.get(col, '')};", subset=pd.IndexSlice[:, [col]])
@@ -316,8 +315,7 @@ def style_shipment(df: pd.DataFrame) -> pd.io.formats.style.Styler:
     return sty.apply(apply_row, axis=1)
 
 
-def style_cargo(df: pd.DataFrame) -> pd.io.formats.style.Styler:
-    sty = df.style
+def style_cargo(df: pd.DataFrame) :
 
     for doc_label in [label for _, label in DOCS]:
         subset = pd.IndexSlice[:, pd.IndexSlice[doc_label, :]]
