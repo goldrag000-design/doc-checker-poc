@@ -41,13 +41,14 @@ SHIPMENT_ROWS = [
 
 CARGO_LINE_COUNT = 5  # Line 1~5
 
+# Column rules per doc:
+# - BL/SWB & Packing List: remove Amount + Code
+# - Proforma: remove Code
+# - BC 1.6: keep Amount + Code
 DOC_COLS = {
-    # BL/SWB & Packing List: no Amount, no Code
     "BL_SWB": ["Brand", "Packing", "QTY", "Gross WT (MT)", "Net WT (MT)"],
     "PACKING_LIST": ["Brand", "Packing", "QTY", "Gross WT (MT)", "Net WT (MT)"],
-    # Proforma: no Code
     "PROFORMA_INVOICE": ["Brand", "Packing", "QTY", "Gross WT (MT)", "Net WT (MT)", "Amount (USD)"],
-    # BC 1.6: keep Amount + Code
     "CUSTOMS_BC16": ["Brand", "Packing", "QTY", "Gross WT (MT)", "Net WT (MT)", "Amount (USD)", "Code"],
 }
 
@@ -105,7 +106,7 @@ def safe_parse_json(raw: str) -> Tuple[Optional[dict], Optional[str]]:
     start = s.find("{")
     end = s.rfind("}")
     if start != -1 and end != -1 and end > start:
-        s = s[start:end + 1]
+        s = s[start : end + 1]
     try:
         obj = json.loads(s)
         if not isinstance(obj, dict):
@@ -543,13 +544,12 @@ def build_total_check_row(doc_key: str, cols: List[str], totals_doc: Dict[str, s
             return False
         return abs(a - b) <= tol
 
-    def decide(doc_val: str, calc_val: str, is_qty=False) -> str:
+    def decide(doc_val: str, calc_val: str) -> str:
         if not norm_spaces(doc_val):
             return ""  # can't compare
-        da = to_float(doc_val) if is_qty else to_float(doc_val)
-        cb = to_float(calc_val) if is_qty else to_float(calc_val)
+        da = to_float(doc_val)
+        cb = to_float(calc_val)
         if da is None or cb is None:
-            # fallback string compare
             return "ok" if norm_spaces(doc_val) == norm_spaces(calc_val) else "no"
         return "ok" if close(da, cb) else "no"
 
@@ -557,21 +557,21 @@ def build_total_check_row(doc_key: str, cols: List[str], totals_doc: Dict[str, s
 
     if doc_key in ["BL_SWB", "PACKING_LIST"]:
         if "QTY" in cols:
-            show["QTY"] = decide(totals_doc.get("qty", ""), totals_calc.get("qty", ""), is_qty=True)
+            show["QTY"] = decide(totals_doc.get("qty", ""), totals_calc.get("qty", ""))
         if "Gross WT (MT)" in cols:
             show["Gross WT (MT)"] = decide(totals_doc.get("gross_wt", ""), totals_calc.get("gross", ""))
         if "Net WT (MT)" in cols:
             show["Net WT (MT)"] = decide(totals_doc.get("net_wt", ""), totals_calc.get("net", ""))
     elif doc_key == "PROFORMA_INVOICE":
         if "QTY" in cols:
-            show["QTY"] = decide(totals_doc.get("qty", ""), totals_calc.get("qty", ""), is_qty=True)
+            show["QTY"] = decide(totals_doc.get("qty", ""), totals_calc.get("qty", ""))
         if "Net WT (MT)" in cols:
             show["Net WT (MT)"] = decide(totals_doc.get("net_wt", ""), totals_calc.get("net", ""))
         if "Amount (USD)" in cols:
             show["Amount (USD)"] = decide(totals_doc.get("amount_usd", ""), totals_calc.get("amt", ""))
     elif doc_key == "CUSTOMS_BC16":
         if "QTY" in cols:
-            show["QTY"] = decide(totals_doc.get("qty", ""), totals_calc.get("qty", ""), is_qty=True)
+            show["QTY"] = decide(totals_doc.get("qty", ""), totals_calc.get("qty", ""))
         if "Gross WT (MT)" in cols:
             show["Gross WT (MT)"] = decide(totals_doc.get("gross_wt", ""), totals_calc.get("gross", ""))
         if "Net WT (MT)" in cols:
@@ -622,7 +622,7 @@ def build_cargo_blocks(extracted: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
         # CALC totals for check only
         totals_calc = compute_totals_from_lines(doc_key, cargo)
 
-        # Total row must be "document totals 그대로" (no autofill)
+        # Total row shows document totals "as-is" (do not auto-fill)
         total_row = {c: "" for c in cols}
         if "QTY" in cols:
             total_row["QTY"] = totals_qty
@@ -659,7 +659,7 @@ def build_cargo_blocks(extracted: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
 def compute_cargo_flags(blocks: Dict[str, Dict[str, Any]]) -> Dict[Tuple[str, str, str], bool]:
     flags = {}
 
-    # HS mismatch 6-digit
+    # HS mismatch 6-digit (red text on HS cell)
     hs_vals = {doc_key: hs6(blocks[doc_key]["hs"]) for doc_key, _ in DOCS}
     non_empty = [v for v in hs_vals.values() if v]
     hs_mis = (len(set(non_empty)) >= 2) if non_empty else False
@@ -671,7 +671,7 @@ def compute_cargo_flags(blocks: Dict[str, Dict[str, Any]]) -> Dict[Tuple[str, st
         for doc_key, _ in DOCS:
             flags[("HS", doc_key, "Brand")] = False
 
-    # Total check row: show red if "no"
+    # Total check row: red only when "no"
     for doc_key, _ in DOCS:
         for c in blocks[doc_key]["cols"]:
             v = norm_spaces(str(blocks[doc_key]["check_row"].get(c, ""))).lower()
@@ -681,7 +681,7 @@ def compute_cargo_flags(blocks: Dict[str, Dict[str, Any]]) -> Dict[Tuple[str, st
 
 
 # =========================
-# HTML rendering (NO Styler)
+# HTML rendering (horizontal + scroll)
 # =========================
 def html_escape(s: str) -> str:
     return (
@@ -697,14 +697,18 @@ def html_escape(s: str) -> str:
 def render_shipment_html(headers, rows, flags) -> str:
     css = """
 <style>
-table.dc { border-collapse: collapse; width: 100%; table-layout: fixed; }
-table.dc th, table.dc td { border: 1px solid #e5e7eb; padding: 8px; vertical-align: top; font-size: 13px; }
+.scrollx { overflow-x: auto; width: 100%; }
+table.dc { border-collapse: collapse; width: max-content; min-width: 100%; }
+table.dc th, table.dc td {
+  border: 1px solid #e5e7eb; padding: 8px; vertical-align: top; font-size: 13px;
+  white-space: nowrap; /* prevent vertical breaking */
+}
 table.dc th { background: #f8fafc; font-weight: 600; }
 table.dc td.item { width: 220px; background: #fafafa; font-weight: 600; }
 .red { color: #dc2626; font-weight: 700; }
 </style>
 """
-    h = [css, '<table class="dc">', "<thead><tr>"]
+    h = [css, '<div class="scrollx">', '<table class="dc">', "<thead><tr>"]
     for col in headers:
         h.append(f"<th>{html_escape(col)}</th>")
     h.append("</tr></thead><tbody>")
@@ -719,7 +723,7 @@ table.dc td.item { width: 220px; background: #fafafa; font-weight: 600; }
             h.append(f'<td class="{cls}">{html_escape(v)}</td>')
         h.append("</tr>")
 
-    h.append("</tbody></table>")
+    h.append("</tbody></table></div>")
     return "\n".join(h)
 
 
@@ -730,8 +734,12 @@ def render_cargo_html(blocks, cargo_flags) -> str:
     """
     css = """
 <style>
-table.dc2 { border-collapse: collapse; width: 100%; table-layout: fixed; }
-table.dc2 th, table.dc2 td { border: 1px solid #e5e7eb; padding: 8px; vertical-align: top; font-size: 13px; }
+.scrollx { overflow-x: auto; width: 100%; }
+table.dc2 { border-collapse: collapse; width: max-content; min-width: 100%; }
+table.dc2 th, table.dc2 td {
+  border: 1px solid #e5e7eb; padding: 8px; vertical-align: top; font-size: 13px;
+  white-space: nowrap; /* prevent vertical breaking */
+}
 table.dc2 th { background: #f8fafc; font-weight: 700; text-align: center; }
 table.dc2 td.group { width: 140px; background: #fafafa; font-weight: 800; }
 table.dc2 td.item  { width: 180px; background: #fcfcfc; font-weight: 700; }
@@ -775,12 +783,11 @@ table.dc2 td.item  { width: 180px; background: #fcfcfc; font-weight: 700; }
         cols = blocks[doc_key]["cols"]
         for c in cols:
             val = blocks[doc_key]["hs"] if c == "Brand" else ""
-            # red only when HS mismatch
             key = ("HS", doc_key, "Brand") if c == "Brand" else ("HSx", doc_key, c)
             rows_html.append(td(key, val))
     rows_html.append("</tr>")
 
-    # Cargo detail (Group col merged only)
+    # Cargo detail (merge ONLY group column)
     for i in range(CARGO_LINE_COUNT):
         rows_html.append("<tr>")
         if i == 0:
@@ -805,7 +812,7 @@ table.dc2 td.item  { width: 180px; background: #fcfcfc; font-weight: 700; }
             rows_html.append(td(("CBM", doc_key, c), val))
     rows_html.append("</tr>")
 
-    # Total (doc totals 그대로)
+    # Total (document totals as-is)
     rows_html.append("<tr>")
     rows_html.append('<td class="group"></td>')
     rows_html.append('<td class="item">Total</td>')
@@ -828,9 +835,9 @@ table.dc2 td.item  { width: 180px; background: #fcfcfc; font-weight: 700; }
     rows_html.append("</tr>")
 
     html = "\n".join(
-        [css, '<table class="dc2">', "<thead>", "".join(r1), "".join(r2), "</thead>", "<tbody>"]
+        [css, '<div class="scrollx">', '<table class="dc2">', "<thead>", "".join(r1), "".join(r2), "</thead>", "<tbody>"]
         + rows_html
-        + ["</tbody></table>"]
+        + ["</tbody></table></div>"]
     )
     return html
 
@@ -840,7 +847,7 @@ table.dc2 td.item  { width: 180px; background: #fcfcfc; font-weight: 700; }
 # =========================
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
-st.caption("Upload is minimized at top-right. Tables are rendered as HTML (no pandas Styler).")
+st.caption("Horizontal text + horizontal scrolling (drag/trackpad) for readability.")
 
 top_left, top_right = st.columns([3.5, 1.5], gap="small")
 
@@ -897,9 +904,12 @@ cargo_flags = compute_cargo_flags(cargo_blocks)
 st.divider()
 k1, k2, k3, k4 = st.columns(4)
 docs_uploaded_count = sum(1 for k, _ in DOCS if uploaded.get(k))
-ship_mis_count = sum(1 for (rk, dl), v in ship_flags.items() if v and rk != "document_number")
+ship_mis_count = sum(1 for (rk, _dl), v in ship_flags.items() if v and rk != "document_number")
 k1.metric("Shipment mismatches", ship_mis_count)
-k2.metric("HS mismatch (6-digit)", "YES" if any(cargo_flags.get(("HS", dk, "Brand"), False) for dk, _ in DOCS) else "NO")
+k2.metric(
+    "HS mismatch (6-digit)",
+    "YES" if any(cargo_flags.get(("HS", dk, "Brand"), False) for dk, _ in DOCS) else "NO",
+)
 k3.metric("Docs uploaded", docs_uploaded_count)
 k4.metric("Extraction errors", len(errors))
 
@@ -916,10 +926,9 @@ st.markdown(render_cargo_html(cargo_blocks, cargo_flags), unsafe_allow_html=True
 
 st.divider()
 st.caption(
-    "Applied rules: "
-    "Doc number mismatch is ignored. "
+    "Rules applied: Doc number mismatch ignored. "
     "POL compares city only. POD compares city only and treats Jakarta as Tanjung Priok. "
-    "Vessel/Voy compares by ignoring punctuation; 'KMTC HOCHIMINH' + '2510S' is treated as equivalent. "
+    "Vessel/Voy ignores punctuation; KMTC HOCHIMINH + 2510S is treated as equivalent. "
     "Container type/amount shows quantity only (container number => 1). "
     "HS comparison ignores punctuation and matches first 6 digits. "
     "KG is converted to MT. "
