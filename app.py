@@ -11,9 +11,11 @@ import streamlit as st
 from pypdf import PdfReader
 from openai import OpenAI
 
+# =========================
+# Config
+# =========================
 APP_TITLE = "Doc Checker PoC — Shipment & Cargo Compare (4 docs)"
 MODEL = "gpt-4.1-mini"
-MAX_CHARS_TO_SEND = 12000
 
 DOCS = [
     ("BL_SWB", "BL / SWB"),
@@ -39,13 +41,21 @@ SHIPMENT_ITEMS = [
 
 CARGO_SUBCOLS = ["Brand", "Packing", "QTY", "Gross WT (MT)", "Net WT (MT)", "Amount (USD)", "Code"]
 
-DOC_COLORS = {
-    "BL / SWB": "#e8f2ff",
-    "Packing List": "#fff1df",
-    "Proforma Invoice": "#f3e8ff",
-    "Customs BC 1.6": "#e8ffe8",
-}
-MISMATCH_RED = "#ffcccc"
+MAX_CHARS_TO_SEND = 12000
+MAX_LINE_ITEMS = 6
+
+
+# =========================
+# Helpers
+# =========================
+def get_api_key() -> str:
+    # Streamlit Cloud Secrets 우선
+    try:
+        if "OPENAI_API_KEY" in st.secrets:
+            return str(st.secrets["OPENAI_API_KEY"] or "")
+    except Exception:
+        pass
+    return os.getenv("OPENAI_API_KEY", "") or ""
 
 
 def pdf_to_text(file) -> str:
@@ -54,27 +64,6 @@ def pdf_to_text(file) -> str:
     for p in reader.pages:
         parts.append(p.extract_text() or "")
     return "\n".join(parts).strip()
-
-
-def get_api_key() -> str:
-    if "OPENAI_API_KEY" in st.secrets:
-        return st.secrets["OPENAI_API_KEY"]
-    return os.getenv("OPENAI_API_KEY", "")
-
-
-def call_openai_once(model: str, prompt: str) -> str:
-    with httpx.Client(
-        verify=certifi.where(),
-        timeout=httpx.Timeout(connect=20.0, read=90.0, write=90.0, pool=90.0),
-        limits=httpx.Limits(max_connections=2, max_keepalive_connections=0),
-    ) as http_client:
-        client = OpenAI(api_key=get_api_key(), http_client=http_client)
-        r = client.responses.create(model=model, input=prompt)
-        return (r.output_text or "").strip()
-
-
-def ping_openai() -> str:
-    return call_openai_once(MODEL, "Reply with exactly: PONG")
 
 
 def norm_spaces(v: str) -> str:
@@ -87,14 +76,16 @@ def city_only(port: str) -> str:
     s = norm_spaces(port)
     if not s:
         return ""
+    # "Busan, South Korea" -> "Busan" 같은 단순화 목적
     s = re.split(r"[,(/]| EX | KRPUS| IDTPP| IDJKT", s, maxsplit=1)[0].strip()
     return s
 
 
-def norm_pod_equivalence(pod: str) -> str:
+def pod_equiv_key(pod: str) -> str:
     s = norm_spaces(pod).lower()
     if not s:
         return ""
+    # Jakarta == Tanjung Priok
     if "jakarta" in s:
         return "tanjung priok"
     if "tanjung priok" in s or "priok" in s:
@@ -103,19 +94,28 @@ def norm_pod_equivalence(pod: str) -> str:
 
 
 def hs6(hs: str) -> str:
+    # 소수점/공백 제거 후 숫자만 추출, 앞 6자리
     s = re.sub(r"\D", "", (hs or ""))
     return s[:6] if s else ""
 
 
 def to_mt(value: str) -> str:
+    """
+    Gross/Net weight는 MT 표준.
+    "12255 KG" -> 12.255
+    "12.255 MT" -> 12.255
+    숫자만 있으면 그대로 MT로 간주
+    """
     s = norm_spaces(value)
     if not s:
         return ""
+
     s_low = s.lower()
-    num = re.findall(r"[-+]?\d[\d,]*\.?\d*", s_low)
-    if not num:
+    nums = re.findall(r"[-+]?\d[\d,]*\.?\d*", s_low)
+    if not nums:
         return s
-    n = num[0].replace(",", "")
+
+    n = nums[0].replace(",", "")
     try:
         x = float(n)
     except Exception:
@@ -123,9 +123,7 @@ def to_mt(value: str) -> str:
 
     if "kg" in s_low:
         x = x / 1000.0
-        return f"{x:.3f}".rstrip("0").rstrip(".")
-    if "mt" in s_low or "ton" in s_low:
-        return f"{x:.3f}".rstrip("0").rstrip(".")
+    # mt/ton이면 그대로
     return f"{x:.3f}".rstrip("0").rstrip(".")
 
 
@@ -134,15 +132,17 @@ def safe_parse_json(raw: str):
         return None, "Empty response"
     s = raw.strip()
 
+    # ```json ... ``` 제거
     if s.startswith("```"):
-        s = s.strip().strip("`")
+        s = s.strip("`").strip()
         if s.lower().startswith("json"):
             s = s[4:].strip()
 
+    # 첫 { ~ 마지막 }로 잘라내기
     start = s.find("{")
     end = s.rfind("}")
     if start != -1 and end != -1 and end > start:
-        s = s[start:end + 1]
+        s = s[start : end + 1]
 
     try:
         return json.loads(s), None
@@ -150,15 +150,27 @@ def safe_parse_json(raw: str):
         return None, f"{type(e).__name__}: {e}"
 
 
+def call_openai_once(prompt: str) -> str:
+    """
+    Streamlit rerun 안정성 위해 요청마다 새 httpx.Client 생성
+    """
+    with httpx.Client(
+        verify=certifi.where(),
+        timeout=httpx.Timeout(connect=20.0, read=90.0, write=90.0, pool=90.0),
+        limits=httpx.Limits(max_connections=2, max_keepalive_connections=0),
+    ) as http_client:
+        client = OpenAI(api_key=get_api_key(), http_client=http_client)
+        r = client.responses.create(model=MODEL, input=prompt)
+        return (r.output_text or "").strip()
+
+
 def build_prompt(doc_label: str, text: str) -> str:
     ship_keys = [k for k, _ in SHIPMENT_ITEMS]
 
-    # 핵심: Indonesian source(BC 1.6 포함) -> output values must be in English
+    # 핵심: BC 1.6 등 인니어 문서는 영어로 해석/정규화해서 결과를 영어로 반환
     rules_translation = (
         "Language rule:\n"
         "- If the source text is Indonesian (e.g., Customs BC 1.6), translate/normalize extracted values into English.\n"
-        "- Examples: 'Pelabuhan Muat' -> port of loading value; 'Berat Kotor/Bersih' -> Gross/Net weight; "
-        "'Nilai CIF' -> CIF value; 'Pemberitahuan Pabean' -> customs declaration.\n"
         "- Keep company names, invoice/BL numbers as-is.\n"
     )
 
@@ -198,9 +210,10 @@ Schema:
 General rules:
 - If not found, use "".
 - For weights: include unit if present (KG or MT). Example: "12255 KG" or "12.255 MT".
-- HS code: keep as written (we normalize later).
+- HS code: keep as written (we normalize later to 6 digits).
 - Keep values short.
 {rules_translation}
+
 DOCUMENT TYPE: {doc_label}
 TEXT:
 -----
@@ -213,9 +226,9 @@ TEXT:
 def extract_doc(doc_label: str, text: str) -> dict:
     prompt = build_prompt(doc_label, text)
     last_err = None
-    for attempt in range(1, 4):
+    for attempt in range(1, 4):  # 3회 시도
         try:
-            raw = call_openai_once(MODEL, prompt)
+            raw = call_openai_once(prompt)
             obj, err = safe_parse_json(raw)
             if err:
                 raise ValueError(err)
@@ -228,31 +241,37 @@ def extract_doc(doc_label: str, text: str) -> dict:
     return {"_error": f"{type(last_err).__name__}: {str(last_err)[:250]}"}
 
 
-def shipment_table(extracted_by_doc: dict) -> pd.DataFrame:
-    colnames = [label for _, label in DOCS]
+# =========================
+# Tables (Always 4 docs)
+# =========================
+def build_shipment_df(extracted_by_doc: dict) -> pd.DataFrame:
+    cols = [label for _, label in DOCS]
     rows = [label for _, label in SHIPMENT_ITEMS]
-    df = pd.DataFrame("", index=rows, columns=colnames)
+    df = pd.DataFrame("", index=rows, columns=cols)
 
     for doc_key, doc_label in DOCS:
-        payload = extracted_by_doc.get(doc_key, {})
+        payload = extracted_by_doc.get(doc_key, {}) if isinstance(extracted_by_doc, dict) else {}
         ship = payload.get("shipment", {}) if isinstance(payload, dict) else {}
         for k, row_label in SHIPMENT_ITEMS:
             df.loc[row_label, doc_label] = norm_spaces(str(ship.get(k, "")))
 
+    # 표시용: 도시만
     df.loc["POL (Port of loading)"] = df.loc["POL (Port of loading)"].apply(city_only)
     df.loc["POD (Port of discharge)"] = df.loc["POD (Port of discharge)"].apply(city_only)
     return df
 
 
-def cargo_table(extracted_by_doc: dict) -> pd.DataFrame:
-    max_lines = 6
-    rows = ["Cargo name", "HS code / pos tarif"] + [f"Line {i}" for i in range(1, max_lines + 1)] + ["Total", "Total check"]
-
+def build_cargo_df(extracted_by_doc: dict) -> pd.DataFrame:
+    rows = (
+        ["Cargo name", "HS code / pos tarif"]
+        + [f"Line {i}" for i in range(1, MAX_LINE_ITEMS + 1)]
+        + ["Total", "Total check"]
+    )
     cols = pd.MultiIndex.from_product([[label for _, label in DOCS], CARGO_SUBCOLS])
     df = pd.DataFrame("", index=rows, columns=cols)
 
     for doc_key, doc_label in DOCS:
-        payload = extracted_by_doc.get(doc_key, {})
+        payload = extracted_by_doc.get(doc_key, {}) if isinstance(extracted_by_doc, dict) else {}
         cargo = payload.get("cargo", {}) if isinstance(payload, dict) else {}
 
         df.loc["Cargo name", (doc_label, "Brand")] = norm_spaces(str(cargo.get("cargo_name", "")))
@@ -262,7 +281,7 @@ def cargo_table(extracted_by_doc: dict) -> pd.DataFrame:
         if not isinstance(line_items, list):
             line_items = []
 
-        for i in range(1, max_lines + 1):
+        for i in range(1, MAX_LINE_ITEMS + 1):
             row = f"Line {i}"
             if i <= len(line_items):
                 li = line_items[i - 1] if isinstance(line_items[i - 1], dict) else {}
@@ -283,100 +302,95 @@ def cargo_table(extracted_by_doc: dict) -> pd.DataFrame:
     return df
 
 
-def style_shipment(df: pd.DataFrame) :
+def compute_kpis(sh_df: pd.DataFrame, cg_df: pd.DataFrame):
+    # Shipment mismatches (doc number mismatch ignored)
+    ship_mis = 0
+    for row in sh_df.index:
+        if row == "Document number":
+            continue
+        vals = [norm_spaces(v) for v in sh_df.loc[row].values if norm_spaces(v)]
+        if len(vals) <= 1:
+            continue
 
-    for col in df.columns:
-        sty = sty.applymap(lambda _: f"background-color: {DOC_COLORS.get(col, '')};", subset=pd.IndexSlice[:, [col]])
+        if row == "POL (Port of loading)":
+            keys = [city_only(v).lower() for v in vals if city_only(v)]
+            if len(set(keys)) >= 2:
+                ship_mis += 1
+        elif row == "POD (Port of discharge)":
+            keys = [pod_equiv_key(v) for v in vals if v]
+            if len(set(keys)) >= 2:
+                ship_mis += 1
+        else:
+            keys = [v.lower() for v in vals]
+            if len(set(keys)) >= 2:
+                ship_mis += 1
 
-    def row_mismatch(row_label: str, values: list[str]) -> bool:
-        vals = [norm_spaces(v) for v in values if norm_spaces(v)]
-        if not vals:
-            return False
-        if row_label == "Document number":
-            return False
-        if row_label == "POL (Port of loading)":
-            vals2 = [city_only(v).lower() for v in vals if city_only(v)]
-            return len(set(vals2)) >= 2
-        if row_label == "POD (Port of discharge)":
-            vals2 = [norm_pod_equivalence(v) for v in vals if v]
-            return len(set(vals2)) >= 2
-        vals2 = [norm_spaces(v).lower() for v in vals]
-        return len(set(vals2)) >= 2
-
-    def apply_row(s: pd.Series):
-        mismatch = row_mismatch(s.name, list(s.values))
-        if not mismatch:
-            return [""] * len(s)
-        out = []
-        for v in s.values:
-            out.append(f"background-color: {MISMATCH_RED};" if norm_spaces(str(v)) else "")
-        return out
-
-    return sty.apply(apply_row, axis=1)
-
-
-def style_cargo(df: pd.DataFrame) :
-
-    for doc_label in [label for _, label in DOCS]:
-        subset = pd.IndexSlice[:, pd.IndexSlice[doc_label, :]]
-        sty = sty.applymap(lambda _: f"background-color: {DOC_COLORS.get(doc_label, '')};", subset=subset)
-
-    # HS 6-digit mismatch highlight
+    # HS mismatch (6-digit)
     hs_vals = []
-    for doc_label in [label for _, label in DOCS]:
-        v = df.loc["HS code / pos tarif", (doc_label, "Brand")]
-        h = hs6(str(v))
-        if h:
-            hs_vals.append(h)
+    for _, doc_label in DOCS:
+        hs_vals.append(hs6(str(cg_df.loc["HS code / pos tarif", (doc_label, "Brand")])))
+    hs_vals = [h for h in hs_vals if h]
+    hs_mismatch = (len(set(hs_vals)) >= 2) if hs_vals else False
 
-    hs_mismatch = len(set(hs_vals)) >= 2
+    # Docs uploaded count (we infer from whether any non-empty cell exists in shipment doc_number)
+    # But more reliable: handled in UI where we know uploaded dict.
+    return ship_mis, hs_mismatch
 
-    if hs_mismatch:
-        for doc_label in [label for _, label in DOCS]:
-            subset = pd.IndexSlice[["HS code / pos tarif"], pd.IndexSlice[doc_label, ["Brand"]]]
-            sty = sty.applymap(lambda _: f"background-color: {MISMATCH_RED};", subset=subset)
 
-    # Total check (line sum vs total)
-    def parse_float(s: str):
-        s = norm_spaces(s).replace(",", "")
-        if not s:
-            return None
-        m = re.findall(r"[-+]?\d*\.?\d+", s)
-        if not m:
-            return None
-        try:
-            return float(m[0])
-        except Exception:
-            return None
+def parse_float(s: str):
+    s = norm_spaces(s).replace(",", "")
+    if not s:
+        return None
+    m = re.findall(r"[-+]?\d*\.?\d+", s)
+    if not m:
+        return None
+    try:
+        return float(m[0])
+    except Exception:
+        return None
+
+
+def compute_total_check(cg_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Total check: line item 합계 vs total 비교하여 ok/no를 "Total check" row에 넣는다.
+    (색칠 없음)
+    """
+    out = cg_df.copy()
 
     def close(a, b, tol=0.001):
         if a is None or b is None:
             return None
         return abs(a - b) <= tol
 
-    for doc_label in [label for _, label in DOCS]:
+    for _, doc_label in DOCS:
         qty_sum = gross_sum = net_sum = amt_sum = 0.0
         has_any = False
-        for i in range(1, 7):
+
+        for i in range(1, MAX_LINE_ITEMS + 1):
             row = f"Line {i}"
-            q = parse_float(str(df.loc[row, (doc_label, "QTY")]))
-            g = parse_float(str(df.loc[row, (doc_label, "Gross WT (MT)")]))
-            n = parse_float(str(df.loc[row, (doc_label, "Net WT (MT)")]))
-            a = parse_float(str(df.loc[row, (doc_label, "Amount (USD)")]))
+            q = parse_float(str(out.loc[row, (doc_label, "QTY")]))
+            g = parse_float(str(out.loc[row, (doc_label, "Gross WT (MT)")]))
+            n = parse_float(str(out.loc[row, (doc_label, "Net WT (MT)")]))
+            a = parse_float(str(out.loc[row, (doc_label, "Amount (USD)")]))
             if any(x is not None for x in [q, g, n, a]):
                 has_any = True
-            if q is not None: qty_sum += q
-            if g is not None: gross_sum += g
-            if n is not None: net_sum += n
-            if a is not None: amt_sum += a
-
-        tq = parse_float(str(df.loc["Total", (doc_label, "Packing")]))
-        tg = parse_float(str(df.loc["Total", (doc_label, "Gross WT (MT)")]))
-        tn = parse_float(str(df.loc["Total", (doc_label, "Net WT (MT)")]))
-        ta = parse_float(str(df.loc["Total", (doc_label, "Amount (USD)")]))
+            if q is not None:
+                qty_sum += q
+            if g is not None:
+                gross_sum += g
+            if n is not None:
+                net_sum += n
+            if a is not None:
+                amt_sum += a
 
         if not has_any:
+            out.loc["Total check", (doc_label, "Brand")] = ""
             continue
+
+        tq = parse_float(str(out.loc["Total", (doc_label, "Packing")]))
+        tg = parse_float(str(out.loc["Total", (doc_label, "Gross WT (MT)")]))
+        tn = parse_float(str(out.loc["Total", (doc_label, "Net WT (MT)")]))
+        ta = parse_float(str(out.loc["Total", (doc_label, "Amount (USD)")]))
 
         checks = []
         for a, b in [(qty_sum, tq), (gross_sum, tg), (net_sum, tn), (amt_sum, ta)]:
@@ -385,15 +399,9 @@ def style_cargo(df: pd.DataFrame) :
                 checks.append(c)
 
         ok = all(checks) if checks else True
-        df.loc["Total check", (doc_label, "Brand")] = "ok" if ok else "no"
+        out.loc["Total check", (doc_label, "Brand")] = "ok" if ok else "no"
 
-        subset = pd.IndexSlice[["Total check"], pd.IndexSlice[doc_label, ["Brand"]]]
-        if ok:
-            sty = sty.applymap(lambda _: "font-weight: 700;", subset=subset)
-        else:
-            sty = sty.applymap(lambda _: f"background-color: {MISMATCH_RED}; font-weight: 700;", subset=subset)
-
-    return sty
+    return out
 
 
 def export_excel(sh_df: pd.DataFrame, cg_df: pd.DataFrame) -> bytes:
@@ -409,94 +417,77 @@ def export_excel(sh_df: pd.DataFrame, cg_df: pd.DataFrame) -> bytes:
 # =========================
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
+st.caption("Upload is minimized at top-right. Tables are centered and full-width below. (No text preview)")
 
+# Upload panel (top-right)
 top_left, top_right = st.columns([3.5, 1.5], gap="small")
+
 with top_left:
-    st.caption("Upload is minimized at top-right. Tables are centered and full-width below.")
+    # Debug kept minimal
+    with st.expander("Debug / Status", expanded=False):
+        key = get_api_key()
+        st.write("API key loaded:", "✅ Yes" if key.startswith("sk-") else "❌ No (OPENAI_API_KEY missing)")
+        st.write("Model:", MODEL)
 
 with top_right:
-    with st.expander("📤 Upload (4 docs)", expanded=False):
+    with st.expander("📤 Upload (4 docs)", expanded=True):
         uploaded = {}
         for doc_key, doc_label in DOCS:
             uploaded[doc_key] = st.file_uploader(doc_label, type=["pdf"], key=f"u_{doc_key}")
-        colA, colB = st.columns([1, 1])
-        with colA:
-            run = st.button("Extract & Compare", use_container_width=True)
-        with colB:
-            mismatch_only = st.checkbox("Mismatch only", value=False)
 
-with st.expander("Debug / Status", expanded=False):
-    key = get_api_key()
-    st.write("API key loaded:", "✅ Yes" if key.startswith("sk-") else "❌ No (OPENAI_API_KEY missing)")
-    if st.button("Ping OpenAI (should return PONG)"):
-        try:
-            st.success(f"Ping result: {ping_openai()}")
-        except Exception as e:
-            st.error(f"Ping failed: {type(e).__name__}: {str(e)[:300]}")
+        run = st.button("Extract & Compare", use_container_width=True)
 
-if not run:
-    st.info("Upload PDFs in the top-right panel, then click **Extract & Compare**.")
-    st.stop()
-
-if not get_api_key().startswith("sk-"):
-    st.error("OPENAI_API_KEY is missing. Set it in Streamlit Cloud Secrets.")
-    st.stop()
-
+# Always create tables (even before extraction)
+# Before extraction: empty extracted_by_doc -> all blank tables
 extracted_by_doc = {}
+
+# If Extract clicked, only call OpenAI for uploaded docs (missing docs stay blank)
 errors = []
+if run:
+    key = get_api_key()
+    if not key.startswith("sk-"):
+        st.error("OPENAI_API_KEY is missing. Set it in Streamlit Cloud Secrets.")
+    else:
+        with st.spinner("Extracting PDFs and calling OpenAI (only for uploaded docs)..."):
+            for doc_key, doc_label in DOCS:
+                f = uploaded.get(doc_key)
+                if not f:
+                    # missing -> keep blank payload
+                    extracted_by_doc[doc_key] = {"shipment": {}, "cargo": {}}
+                    continue
 
-with st.spinner("Extracting PDFs and calling OpenAI..."):
-    for doc_key, doc_label in DOCS:
-        f = uploaded.get(doc_key)
-        if not f:
-            extracted_by_doc[doc_key] = {"_error": "Missing file"}
-            continue
+                try:
+                    text = pdf_to_text(f)
+                    if not text.strip():
+                        extracted_by_doc[doc_key] = {"shipment": {}, "cargo": {}}
+                        errors.append(f"[{doc_label}] No text extracted (scanned PDF?)")
+                        continue
+                except Exception as e:
+                    extracted_by_doc[doc_key] = {"shipment": {}, "cargo": {}}
+                    errors.append(f"[{doc_label}] PDF read error: {type(e).__name__}: {str(e)[:150]}")
+                    continue
 
-        try:
-            text = pdf_to_text(f)
-            if not text.strip():
-                extracted_by_doc[doc_key] = {"_error": "No text extracted (scanned PDF?)"}
-                continue
-        except Exception as e:
-            extracted_by_doc[doc_key] = {"_error": f"PDF read error: {type(e).__name__}: {str(e)[:150]}"}
-            continue
+                obj = extract_doc(doc_label, text)
+                if isinstance(obj, dict) and "_error" in obj:
+                    errors.append(f"[{doc_label}] {obj['_error']}")
+                    # keep blank on error
+                    extracted_by_doc[doc_key] = {"shipment": {}, "cargo": {}}
+                else:
+                    extracted_by_doc[doc_key] = obj
 
-        obj = extract_doc(doc_label, text)
-        extracted_by_doc[doc_key] = obj
-        if "_error" in obj:
-            errors.append(f"[{doc_label}] {obj['_error']}")
+# Build tables
+ship_df = build_shipment_df(extracted_by_doc)
+cargo_df = build_cargo_df(extracted_by_doc)
+cargo_df = compute_total_check(cargo_df)
 
-ship_df = shipment_table(extracted_by_doc)
-cargo_df = cargo_table(extracted_by_doc)
-
-# KPI row
-hs_vals = []
-for doc_label in [label for _, label in DOCS]:
-    hs_vals.append(hs6(str(cargo_df.loc["HS code / pos tarif", (doc_label, "Brand")])))
-hs_mismatch = len(set([h for h in hs_vals if h])) >= 2
+# KPI row (always shown; meaningful after extraction)
+ship_mis, hs_mismatch = compute_kpis(ship_df, cargo_df)
+docs_uploaded_count = sum(1 for k, _ in DOCS if uploaded.get(k))  # actual uploaded in UI
 
 k1, k2, k3, k4 = st.columns(4)
-# shipment mismatch count
-ship_mis = 0
-for idx in ship_df.index:
-    vals = [norm_spaces(v) for v in ship_df.loc[idx].values if norm_spaces(v)]
-    if not vals:
-        continue
-    if idx == "Document number":
-        continue
-    if idx == "POL (Port of loading)":
-        if len(set([city_only(v).lower() for v in vals if city_only(v)])) >= 2:
-            ship_mis += 1
-    elif idx == "POD (Port of discharge)":
-        if len(set([norm_pod_equivalence(v) for v in vals if v])) >= 2:
-            ship_mis += 1
-    else:
-        if len(set([v.lower() for v in vals])) >= 2:
-            ship_mis += 1
-
 k1.metric("Shipment mismatches", ship_mis)
 k2.metric("HS mismatch (6-digit)", "YES" if hs_mismatch else "NO")
-k3.metric("Docs uploaded", sum(1 for k, _ in DOCS if uploaded.get(k)))
+k3.metric("Docs uploaded", docs_uploaded_count)
 k4.metric("Extraction errors", len(errors))
 
 if errors:
@@ -504,46 +495,14 @@ if errors:
         for e in errors:
             st.error(e)
 
+# Display tables (NO styling / NO coloring)
 st.subheader("Shipment Information")
-ship_view = ship_df.copy()
-if mismatch_only:
-    keep = []
-    for idx in ship_view.index:
-        if idx == "Document number":
-            continue
-        vals = [norm_spaces(v) for v in ship_view.loc[idx].values if norm_spaces(v)]
-        if not vals:
-            continue
-        if idx == "POL (Port of loading)":
-            if len(set([city_only(v).lower() for v in vals if city_only(v)])) >= 2:
-                keep.append(idx)
-        elif idx == "POD (Port of discharge)":
-            if len(set([norm_pod_equivalence(v) for v in vals if v])) >= 2:
-                keep.append(idx)
-        else:
-            if len(set([v.lower() for v in vals])) >= 2:
-                keep.append(idx)
-    ship_view = ship_view.loc[keep] if keep else ship_view.iloc[0:0]
-
-st.dataframe(style_shipment(ship_view), use_container_width=True)
+st.dataframe(ship_df, use_container_width=True)
 
 st.subheader("Cargo Information")
-cargo_view = cargo_df.copy()
-if mismatch_only:
-    rows_keep = ["Cargo name", "HS code / pos tarif", "Total", "Total check"]
-    for i in range(1, 7):
-        row = f"Line {i}"
-        has_any = False
-        for doc_label in [label for _, label in DOCS]:
-            if any(norm_spaces(str(cargo_view.loc[row, (doc_label, c)])) for c in CARGO_SUBCOLS):
-                has_any = True
-                break
-        if has_any:
-            rows_keep.append(row)
-    cargo_view = cargo_view.loc[rows_keep]
+st.dataframe(cargo_df, use_container_width=True)
 
-st.dataframe(style_cargo(cargo_view), use_container_width=True)
-
+# Export
 st.divider()
 excel_bytes = export_excel(ship_df, cargo_df)
 st.download_button(
@@ -554,7 +513,7 @@ st.download_button(
 )
 
 st.caption(
-    "Rules: Doc number mismatch is ignored (no red). POL compares city only. POD compares city only and treats Jakarta as Tanjung Priok. "
-    "HS comparison ignores punctuation and matches first 6 digits. KG is converted to MT. Total check compares line sums vs totals (ok/no). "
+    "Rules: Doc number mismatch is ignored. POL compares city only. POD compares city only and treats Jakarta as Tanjung Priok. "
+    "HS comparison ignores punctuation and matches first 6 digits. KG is converted to MT. "
+    "Total check compares line sums vs totals (ok/no). "
     "For Indonesian source text (e.g., BC 1.6), extracted values are translated/normalized into English."
-)
