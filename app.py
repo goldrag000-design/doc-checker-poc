@@ -516,4 +516,4 @@ st.caption(
     "Rules: Doc number mismatch is ignored. POL compares city only. POD compares city only and treats Jakarta as Tanjung Priok. "
     "HS comparison ignores punctuation and matches first 6 digits. KG is converted to MT. "
     "Total check compares line sums vs totals (ok/no). "
-    "For Indonesian source text (e.g., BC 1.6), extracted values are translated/normalized into English."
+    "For Indonesian source text (e.g., BC 1.6), extracted values are translated/normalized into English.")
