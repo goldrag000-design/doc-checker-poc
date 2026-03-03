@@ -24,7 +24,6 @@ DOCS = [
     ("CUSTOMS_BC16", "Customs BC 1.6"),
 ]
 
-# Shipment rows (left labels)
 SHIPMENT_ROWS = [
     ("document_number", "Document number"),
     ("shipper", "Shipper"),
@@ -40,30 +39,19 @@ SHIPMENT_ROWS = [
     ("container_40", "Container type / amount (40')"),
 ]
 
-# Cargo structure (your requested layout)
-CARGO_ROWS = [
-    ("cargo_name", "Cargo name"),
-    ("hs_code", "HS code / pos tarif"),
-    ("cargo_detail", "Cargo detail"),       # merge Line 1~5 into one cell (multi-line)
-    ("measurement_cbm", "Measurement (CBM)"),  # Line 6 renamed, value from BL/SWB
-    ("total", "Total"),
-    ("total_check", "Total check"),
-]
+CARGO_LINE_COUNT = 5  # Line 1~5
 
-# Per-document visible columns (Requirement #2 #3)
-# - BL/SWB: remove Amount + Code
-# - Packing List: remove Amount + Code
-# - Proforma Invoice: remove Code
-# - BC 1.6: keep Amount + Code
 DOC_COLS = {
+    # BL/SWB & Packing List: no Amount, no Code
     "BL_SWB": ["Brand", "Packing", "QTY", "Gross WT (MT)", "Net WT (MT)"],
     "PACKING_LIST": ["Brand", "Packing", "QTY", "Gross WT (MT)", "Net WT (MT)"],
+    # Proforma: no Code
     "PROFORMA_INVOICE": ["Brand", "Packing", "QTY", "Gross WT (MT)", "Net WT (MT)", "Amount (USD)"],
+    # BC 1.6: keep Amount + Code
     "CUSTOMS_BC16": ["Brand", "Packing", "QTY", "Gross WT (MT)", "Net WT (MT)", "Amount (USD)", "Code"],
 }
 
 MAX_TEXT_CHARS = 12000
-MAX_LINE_ITEMS = 10  # extraction can bring more; we compress into Cargo detail
 
 
 # =========================
@@ -101,7 +89,6 @@ def pdf_to_text(file) -> str:
 
 
 def file_fingerprint(uploaded_file) -> str:
-    # cache key: filename + size + sha1 of first chunk
     data = uploaded_file.getvalue()
     h = hashlib.sha1(data).hexdigest()
     return f"{uploaded_file.name}:{len(data)}:{h}"
@@ -125,7 +112,7 @@ def safe_parse_json(raw: str) -> Tuple[Optional[dict], Optional[str]]:
             return None, "JSON is not an object"
         return obj, None
     except Exception as e:
-        return None, f"{type(e)._name_}: {e}"
+        return None, f"{type(e).__name__}: {e}"
 
 
 # =========================
@@ -141,7 +128,6 @@ def city_only(port: str) -> str:
     s = norm_spaces(port)
     if not s:
         return ""
-    # Keep first token before comma/paren/slash
     s = re.split(r"[,(/]", s, maxsplit=1)[0].strip()
     return s
 
@@ -150,7 +136,6 @@ def pod_equiv_key(pod: str) -> str:
     s = norm_spaces(pod).lower()
     if not s:
         return ""
-    # Jakarta == Tanjung Priok
     if "jakarta" in s:
         return "tanjung priok"
     if "tanjung priok" in s or "priok" in s:
@@ -177,14 +162,11 @@ def to_float(s: str) -> Optional[float]:
 
 
 def to_mt(value: str) -> str:
-    """
-    Convert KG->MT. Keep 3 decimals (trim zeros).
-    """
     s = norm_spaces(value)
     if not s:
         return ""
     low = s.lower()
-    nums = re.findall(r"[-+]?\d[\d,]\.?\d", low)
+    nums = re.findall(r"[-+]?\d[\d,]*\.?\d*", low)
     if not nums:
         return s
     n = nums[0].replace(",", "")
@@ -197,18 +179,71 @@ def to_mt(value: str) -> str:
     return f"{x:.3f}".rstrip("0").rstrip(".")
 
 
+def vessel_key(v: str) -> str:
+    """
+    Rule:
+    - treat as same if it matches "kmtc hochiminh" and "2510s"
+    - ignore punctuation (/ . spaces etc.)
+    """
+    s = re.sub(r"[^a-z0-9]", "", (v or "").lower())
+    if not s:
+        return ""
+    if ("kmtc" in s) and ("hochiminh" in s) and ("2510s" in s):
+        return "kmtchochiminh2510s"
+    return s
+
+
+CONTAINER_NO_RE = re.compile(r"\b[A-Z]{4}\d{7}\b")
+
+
+def container_qty_only(v: str) -> str:
+    """
+    Display only quantity number.
+    If it looks like a container number (e.g., TEMU0373972), treat as qty=1.
+    Else try to extract qty from patterns like x1, 1x, qty 1, 1 container, etc.
+    """
+    s = norm_spaces(v)
+    if not s:
+        return ""
+
+    # If container number exists => assume 1
+    if CONTAINER_NO_RE.search(s.upper()):
+        return "1"
+
+    low = s.lower()
+
+    # x1 / x 1
+    m = re.search(r"x\s*(\d+)", low)
+    if m:
+        return m.group(1)
+
+    # 1x
+    m = re.search(r"(\d+)\s*x", low)
+    if m:
+        return m.group(1)
+
+    # qty: 1
+    m = re.search(r"(?:qty|quantity)\s*[:\-]?\s*(\d+)", low)
+    if m:
+        return m.group(1)
+
+    # 1 container / 1 cont / 1 unit
+    m = re.search(r"\b(\d+)\b\s*(?:containers?|conts?|cont|units?|unit|ctn)\b", low)
+    if m:
+        return m.group(1)
+
+    # if it's just digits already
+    if re.fullmatch(r"\d+", s):
+        return s
+
+    return ""
+
+
 # =========================
 # Prompt (doc-specific rules included)
 # =========================
 def build_prompt(doc_key: str, doc_label: str, text: str) -> str:
-    """
-    Enforces your doc-specific interpretations:
-    - BC 1.6: translate Indonesian -> English
-    - BC 1.6: totals.gross_wt MUST be from 'berat kotor' (item 31) and line gross can be blank
-    - Proforma: per-line 'WT' should be treated as NET WT (store into net_wt)
-    - BL/SWB: measurement_cbm should be extracted (if any)
-    """
-    common_schema = """
+    schema = """
 Return ONLY valid JSON (no markdown).
 
 Schema:
@@ -250,7 +285,8 @@ Schema:
     ]
   }
 }
-Rules:
+
+General rules:
 - If not found, use "".
 - Keep company names and document numbers as-is.
 - Weights: include unit if present (KG or MT).
@@ -258,28 +294,31 @@ Rules:
 - Keep values short.
 """
 
-    doc_rules = ""
+    doc_rules = """
+Shipment rules:
+- container_20 and container_40 MUST be quantity ONLY (a number). If only a container number is shown, use 1.
+"""
+
     if doc_key == "CUSTOMS_BC16":
-        doc_rules = """
+        doc_rules += """
 Document-specific rules (Customs BC 1.6):
 - Source text is Indonesian; translate extracted values into English (company names stay as-is).
 - IMPORTANT: cargo.totals.gross_wt must be the value from 'Berat Kotor' (usually item 31).
-- For BC 1.6 line_items: you may omit/leave gross_wt blank; net_wt and amount/code can be provided per line.
+- For BC 1.6 line_items: gross_wt can be blank; net_wt and amount/code per line are OK.
 """
     elif doc_key == "PROFORMA_INVOICE":
-        doc_rules = """
+        doc_rules += """
 Document-specific rules (Proforma Invoice):
 - If the document shows a single weight per brand/line (e.g., "WT"), treat it as NET WT.
   Put it into line_items[].net_wt (NOT gross_wt).
-- If totals for QTY are not explicitly written, you can still fill totals.qty if clearly inferable; otherwise leave "".
 """
     elif doc_key == "BL_SWB":
-        doc_rules = """
+        doc_rules += """
 Document-specific rules (BL/SWB):
-- Extract measurement_cbm if shown (e.g., "Measurement (CBM)").
+- Extract measurement_cbm if shown (Measurement/CBM).
 """
     else:
-        doc_rules = """
+        doc_rules += """
 Document-specific rules (Packing List):
 - Extract per line qty/gross/net if present.
 """
@@ -287,7 +326,7 @@ Document-specific rules (Packing List):
     return f"""
 You extract structured data from shipping/customs documents.
 
-{common_schema}
+{schema}
 {doc_rules}
 
 DOCUMENT TYPE: {doc_label}
@@ -300,9 +339,6 @@ TEXT:
 
 @st.cache_data(show_spinner=False)
 def extract_cached(doc_key: str, doc_label: str, fp: str, text: str) -> Dict[str, Any]:
-    """
-    Cached by file fingerprint so repeated uploads are fast.
-    """
     last_err = None
     prompt = build_prompt(doc_key, doc_label, text)
     for attempt in range(1, 4):
@@ -315,11 +351,11 @@ def extract_cached(doc_key: str, doc_label: str, fp: str, text: str) -> Dict[str
         except Exception as e:
             last_err = e
             time.sleep(2 ** (attempt - 1))
-    return {"error": f"{type(last_err).name_}: {str(last_err)[:250]}"}
+    return {"_error": f"{type(last_err).__name__}: {str(last_err)[:250]}"}
 
 
 # =========================
-# Build Shipment table (with mismatch -> red text)
+# Shipment compare (red text on mismatch)
 # =========================
 def shipment_value_for_compare(row_key: str, v: str) -> str:
     v = norm_spaces(v)
@@ -329,17 +365,14 @@ def shipment_value_for_compare(row_key: str, v: str) -> str:
         return city_only(v).lower()
     if row_key == "pod":
         return pod_equiv_key(v)
-    if row_key == "document_number":
-        # ignored mismatch
-        return v.lower()
+    if row_key == "vessel_voy":
+        return vessel_key(v)
+    if row_key in ("container_20", "container_40"):
+        return container_qty_only(v)
     return v.lower()
 
 
-def build_shipment_matrix(extracted: Dict[str, Any]) -> Tuple[List[str], List[Tuple[str, Dict[str, str]]]]:
-    """
-    returns headers + rows
-    rows: (row_label, {doc_label: value})
-    """
+def build_shipment_matrix(extracted: Dict[str, Any]) -> Tuple[List[str], List[Tuple[str, str, Dict[str, str]]]]:
     headers = ["ITEM"] + [label for _, label in DOCS]
     rows = []
     for row_key, row_label in SHIPMENT_ROWS:
@@ -347,31 +380,32 @@ def build_shipment_matrix(extracted: Dict[str, Any]) -> Tuple[List[str], List[Tu
         for doc_key, doc_label in DOCS:
             payload = extracted.get(doc_key, {})
             ship = payload.get("shipment", {}) if isinstance(payload, dict) else {}
-
             val = norm_spaces(str(ship.get(row_key, "")))
 
-            # Requirement #1: BL/SWB PLB operator must always be blank
+            # BL/SWB PLB operator always blank
             if doc_key == "BL_SWB" and row_key == "plb_operator":
                 val = ""
 
-            # City-only view for display (pol/pod)
+            # Display rules
             if row_key == "pol":
                 val = city_only(val).upper() if val else ""
             if row_key == "pod":
                 val = city_only(val).upper() if val else ""
+
+            # Containers: show qty only
+            if row_key in ("container_20", "container_40"):
+                val = container_qty_only(val)
 
             row_map[doc_label] = val
         rows.append((row_key, row_label, row_map))
     return headers, rows
 
 
-def compute_shipment_mismatch_flags(rows, ignore_doc_number=True) -> Dict[Tuple[str, str], bool]:
-    """
-    Returns flags for (row_key, doc_label) -> mismatch boolean.
-    """
+def compute_shipment_mismatch_flags(rows) -> Dict[Tuple[str, str], bool]:
     flags = {}
-    for row_key, row_label, row_map in rows:
-        if ignore_doc_number and row_key == "document_number":
+    for row_key, _, row_map in rows:
+        # Doc number mismatch ignored
+        if row_key == "document_number":
             for _, doc_label in DOCS:
                 flags[(row_key, doc_label)] = False
             continue
@@ -385,10 +419,8 @@ def compute_shipment_mismatch_flags(rows, ignore_doc_number=True) -> Dict[Tuple[
                 flags[(row_key, doc_label)] = False
             continue
 
-        # mismatch if at least 2 different compare keys
         mismatch = (len(set(non_empty)) >= 2)
         if mismatch:
-            # mark only cells that are non-empty and differ from majority/first non-empty baseline
             baseline = non_empty[0]
             for idx, (_, doc_label) in enumerate(DOCS):
                 c = comps[idx]
@@ -400,67 +432,57 @@ def compute_shipment_mismatch_flags(rows, ignore_doc_number=True) -> Dict[Tuple[
 
 
 # =========================
-# Build Cargo table (custom layout + mismatch -> red text)
+# Cargo building
 # =========================
-def line_items_to_detail_lines(doc_key: str, cargo: dict) -> List[str]:
-    """
-    Merge Line 1~5 into a single multiline list like:
-    STY | BUNDLE | 1 | 1.126 | 1.123 | 3248.84 | TIP
-    but only include columns applicable to that doc.
-    """
-    cols = DOC_COLS[doc_key]
+def get_line_item(cargo: dict, idx: int) -> dict:
     li = cargo.get("line_items", []) if isinstance(cargo, dict) else []
     if not isinstance(li, list):
-        li = []
+        return {}
+    if idx < 0 or idx >= len(li):
+        return {}
+    it = li[idx]
+    return it if isinstance(it, dict) else {}
 
-    out = []
-    for item in li[:5]:  # merge 1~5 only
-        if not isinstance(item, dict):
-            continue
-        brand = norm_spaces(str(item.get("brand", "")))
-        packing = norm_spaces(str(item.get("packing", "")))
-        qty = norm_spaces(str(item.get("qty", "")))
 
-        gross = to_mt(str(item.get("gross_wt", "")))
-        net = to_mt(str(item.get("net_wt", "")))
-        amt = norm_spaces(str(item.get("amount_usd", "")))
-        code = norm_spaces(str(item.get("code", "")))
+def line_cell_value(doc_key: str, cargo: dict, line_idx: int, col: str) -> str:
+    it = get_line_item(cargo, line_idx)
 
-        # Requirement #8: Proforma "WT" treated as net_wt already by prompt; but if gross has value and net empty, move it.
-        if doc_key == "PROFORMA_INVOICE":
-            if gross and not net:
-                net = gross
-                gross = ""
+    brand = norm_spaces(str(it.get("brand", "")))
+    packing = norm_spaces(str(it.get("packing", "")))
+    qty = norm_spaces(str(it.get("qty", "")))
+    gross = to_mt(str(it.get("gross_wt", "")))
+    net = to_mt(str(it.get("net_wt", "")))
+    amt = norm_spaces(str(it.get("amount_usd", "")))
+    code = norm_spaces(str(it.get("code", "")))
 
-        pieces = []
-        # Build per visible columns
-        for c in cols:
-            if c == "Brand":
-                pieces.append(brand)
-            elif c == "Packing":
-                pieces.append(packing)
-            elif c == "QTY":
-                pieces.append(qty)
-            elif c == "Gross WT (MT)":
-                pieces.append(gross)
-            elif c == "Net WT (MT)":
-                pieces.append(net)
-            elif c == "Amount (USD)":
-                pieces.append(amt)
-            elif c == "Code":
-                pieces.append(code)
+    # Proforma: treat WT as NET if gross filled but net empty
+    if doc_key == "PROFORMA_INVOICE":
+        if gross and not net:
+            net = gross
+            gross = ""
 
-        # Skip fully empty lines
-        if any(p for p in pieces):
-            out.append(" | ".join([p if p else "" for p in pieces]))
-    return out
+    # BC 1.6 Gross WT should not appear per line (total only)
+    if doc_key == "CUSTOMS_BC16" and col == "Gross WT (MT)":
+        return ""
+
+    if col == "Brand":
+        return brand
+    if col == "Packing":
+        return packing
+    if col == "QTY":
+        return qty
+    if col == "Gross WT (MT)":
+        return gross
+    if col == "Net WT (MT)":
+        return net
+    if col == "Amount (USD)":
+        return amt
+    if col == "Code":
+        return code
+    return ""
 
 
 def compute_totals_from_lines(doc_key: str, cargo: dict) -> Dict[str, str]:
-    """
-    Requirement #6-9: totals.qty might not exist in docs -> calculate and fill.
-    Also convert KG->MT.
-    """
     li = cargo.get("line_items", []) if isinstance(cargo, dict) else []
     if not isinstance(li, list):
         li = []
@@ -471,15 +493,15 @@ def compute_totals_from_lines(doc_key: str, cargo: dict) -> Dict[str, str]:
     amt_sum = 0.0
     has_any = False
 
-    for item in li:
-        if not isinstance(item, dict):
+    for it in li:
+        if not isinstance(it, dict):
             continue
-        q = to_float(str(item.get("qty", "")))
-        g = to_float(to_mt(str(item.get("gross_wt", ""))))
-        n = to_float(to_mt(str(item.get("net_wt", ""))))
-        a = to_float(str(item.get("amount_usd", "")))
+        q = to_float(str(it.get("qty", "")))
+        g = to_float(to_mt(str(it.get("gross_wt", ""))))
+        n = to_float(to_mt(str(it.get("net_wt", ""))))
+        a = to_float(str(it.get("amount_usd", "")))
 
-        # proforma: if gross filled but net empty, treat as net
+        # Proforma: WT as net
         if doc_key == "PROFORMA_INVOICE":
             if g is not None and n is None:
                 n = g
@@ -508,69 +530,59 @@ def compute_totals_from_lines(doc_key: str, cargo: dict) -> Dict[str, str]:
     }
 
 
-def cargo_total_check(doc_key: str, totals_from_doc: Dict[str, str], totals_calc: Dict[str, str]) -> Dict[str, str]:
+def build_total_check_row(doc_key: str, cols: List[str], totals_doc: Dict[str, str], totals_calc: Dict[str, str]) -> Dict[str, str]:
     """
-    Requirement #6-9: Total check shown only under specified columns.
-    We'll produce per-column ok/no strings (or "") and compare doc totals to calc totals when doc totals exist.
-    If doc totals missing -> we fill totals with calc and mark ok.
+    Total row = doc totals (unchanged).
+    Total check compares (sum of line items) vs (doc totals).
+    - ok in black
+    - no in red
+    If doc total is blank => check cell blank (no judgement).
     """
     def close(a: Optional[float], b: Optional[float], tol=0.001) -> bool:
         if a is None or b is None:
-            return True  # if either missing, don't fail
+            return False
         return abs(a - b) <= tol
 
-    # Doc totals (raw)
-    doc_qty = to_float(totals_from_doc.get("qty", ""))
-    doc_g = to_float(to_mt(totals_from_doc.get("gross_wt", "")))
-    doc_n = to_float(to_mt(totals_from_doc.get("net_wt", "")))
-    doc_a = to_float(totals_from_doc.get("amount_usd", ""))
+    def decide(doc_val: str, calc_val: str, is_qty=False) -> str:
+        if not norm_spaces(doc_val):
+            return ""  # can't compare
+        da = to_float(doc_val) if is_qty else to_float(doc_val)
+        cb = to_float(calc_val) if is_qty else to_float(calc_val)
+        if da is None or cb is None:
+            # fallback string compare
+            return "ok" if norm_spaces(doc_val) == norm_spaces(calc_val) else "no"
+        return "ok" if close(da, cb) else "no"
 
-    calc_qty = to_float(totals_calc.get("qty", ""))
-    calc_g = to_float(totals_calc.get("gross", ""))
-    calc_n = to_float(totals_calc.get("net", ""))
-    calc_a = to_float(totals_calc.get("amt", ""))
-
-    # If doc missing qty, treat as ok after we fill it from calc
-    ok_qty = close(doc_qty, calc_qty)
-    ok_g = close(doc_g, calc_g)
-    ok_n = close(doc_n, calc_n)
-    ok_a = close(doc_a, calc_a)
-
-    # Where to show check
-    show = {c: "" for c in DOC_COLS[doc_key]}
+    show = {c: "" for c in cols}
 
     if doc_key in ["BL_SWB", "PACKING_LIST"]:
-        # only QTY, Gross, Net
-        show["QTY"] = "ok" if ok_qty else "no"
-        show["Gross WT (MT)"] = "ok" if ok_g else "no"
-        show["Net WT (MT)"] = "ok" if ok_n else "no"
+        if "QTY" in cols:
+            show["QTY"] = decide(totals_doc.get("qty", ""), totals_calc.get("qty", ""), is_qty=True)
+        if "Gross WT (MT)" in cols:
+            show["Gross WT (MT)"] = decide(totals_doc.get("gross_wt", ""), totals_calc.get("gross", ""))
+        if "Net WT (MT)" in cols:
+            show["Net WT (MT)"] = decide(totals_doc.get("net_wt", ""), totals_calc.get("net", ""))
     elif doc_key == "PROFORMA_INVOICE":
-        # QTY, Net, Amount
-        show["QTY"] = "ok" if ok_qty else "no"
-        show["Net WT (MT)"] = "ok" if ok_n else "no"
-        show["Amount (USD)"] = "ok" if ok_a else "no"
+        if "QTY" in cols:
+            show["QTY"] = decide(totals_doc.get("qty", ""), totals_calc.get("qty", ""), is_qty=True)
+        if "Net WT (MT)" in cols:
+            show["Net WT (MT)"] = decide(totals_doc.get("net_wt", ""), totals_calc.get("net", ""))
+        if "Amount (USD)" in cols:
+            show["Amount (USD)"] = decide(totals_doc.get("amount_usd", ""), totals_calc.get("amt", ""))
     elif doc_key == "CUSTOMS_BC16":
-        # QTY, Gross, Net, Amount
-        show["QTY"] = "ok" if ok_qty else "no"
-        show["Gross WT (MT)"] = "ok" if ok_g else "no"
-        show["Net WT (MT)"] = "ok" if ok_n else "no"
-        show["Amount (USD)"] = "ok" if ok_a else "no"
+        if "QTY" in cols:
+            show["QTY"] = decide(totals_doc.get("qty", ""), totals_calc.get("qty", ""), is_qty=True)
+        if "Gross WT (MT)" in cols:
+            show["Gross WT (MT)"] = decide(totals_doc.get("gross_wt", ""), totals_calc.get("gross", ""))
+        if "Net WT (MT)" in cols:
+            show["Net WT (MT)"] = decide(totals_doc.get("net_wt", ""), totals_calc.get("net", ""))
+        if "Amount (USD)" in cols:
+            show["Amount (USD)"] = decide(totals_doc.get("amount_usd", ""), totals_calc.get("amt", ""))
 
     return show
 
 
 def build_cargo_blocks(extracted: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
-    """
-    Returns per doc block:
-      {
-        "Cargo name": {...},
-        "HS": {...},
-        "Cargo detail": "multiline",
-        "Measurement (CBM)": "...",
-        "Total": {col:value},
-        "Total check": {col: ok/no}
-      }
-    """
     blocks = {}
     for doc_key, doc_label in DOCS:
         payload = extracted.get(doc_key, {})
@@ -584,11 +596,10 @@ def build_cargo_blocks(extracted: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
         hs = norm_spaces(str(cargo.get("hs_code", "")))
         meas = norm_spaces(str(cargo.get("measurement_cbm", "")))
 
-        # Requirement #4: Measurement only from BL/SWB
+        # Measurement only from BL/SWB
         if doc_key != "BL_SWB":
             meas = ""
 
-        # Totals from doc (raw)
         totals = cargo.get("totals", {}) if isinstance(cargo, dict) else {}
         if not isinstance(totals, dict):
             totals = {}
@@ -598,160 +609,71 @@ def build_cargo_blocks(extracted: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
         totals_n = to_mt(str(totals.get("net_wt", "")))
         totals_a = norm_spaces(str(totals.get("amount_usd", "")))
 
-        # Requirement #5: BC1.6 gross should be TOTAL ONLY (berat kotor item 31)
-        # We enforce: do not show per-line gross; only Total row gross will be populated.
-        # (Already handled by prompt; still keep safety)
-        if doc_key == "CUSTOMS_BC16":
-            # keep totals_g as-is; detail lines won't include gross if extracted; we won't show per-line gross in merged detail anyway.
-            pass
-
-        # Calculate totals from line items (to fill missing qty, etc.)
-        totals_calc = compute_totals_from_lines(doc_key, cargo)
-
-        # Requirement #6-9: If doc totals missing qty -> fill with calc
-        if not totals_qty and totals_calc["qty"]:
-            totals_qty = totals_calc["qty"]
-
-        # For BL & Packing: amount not applicable -> ignore
-        if doc_key in ["BL_SWB", "PACKING_LIST"]:
-            totals_a = ""
-
-        # For Proforma: gross shown in doc should be treated as net
+        # Proforma totals: if gross provided but net empty -> move to net
         if doc_key == "PROFORMA_INVOICE":
-            # If totals_g exists and totals_n empty, move gross->net
             if totals_g and not totals_n:
                 totals_n = totals_g
                 totals_g = ""
 
-        # Build cargo detail lines (merged 1~5)
-        detail_lines = line_items_to_detail_lines(doc_key, cargo)
-        detail_text = "\n".join(detail_lines)
+        # BL/Packing: no amount
+        if doc_key in ["BL_SWB", "PACKING_LIST"]:
+            totals_a = ""
 
-        # Total row values per visible cols
+        # CALC totals for check only
+        totals_calc = compute_totals_from_lines(doc_key, cargo)
+
+        # Total row must be "document totals 그대로" (no autofill)
         total_row = {c: "" for c in cols}
-        if "Brand" in cols:
-            total_row["Brand"] = ""
-        if "Packing" in cols:
-            # show bundles if available in doc? If not, keep blank. We keep qty in QTY and weights in weight cols.
-            total_row["Packing"] = totals_qty if ("Packing" in cols and doc_key in ["BL_SWB", "PACKING_LIST", "PROFORMA_INVOICE", "CUSTOMS_BC16"]) else ""
-
-        # Better: Put qty in QTY column if present
         if "QTY" in cols:
             total_row["QTY"] = totals_qty
-
         if "Gross WT (MT)" in cols:
-            # BC1.6: total gross only (berat kotor)
-            total_row["Gross WT (MT)"] = totals_g if doc_key != "PROFORMA_INVOICE" else ""  # proforma gross not used
+            total_row["Gross WT (MT)"] = totals_g if doc_key != "PROFORMA_INVOICE" else ""
         if "Net WT (MT)" in cols:
             total_row["Net WT (MT)"] = totals_n
         if "Amount (USD)" in cols:
             total_row["Amount (USD)"] = totals_a
+        if "Brand" in cols:
+            total_row["Brand"] = ""
+        if "Packing" in cols:
+            total_row["Packing"] = ""
         if "Code" in cols:
             total_row["Code"] = ""
 
-        # Total check row
-        totals_from_doc = {
-            "qty": totals_qty,
-            "gross_wt": totals_g,
-            "net_wt": totals_n,
-            "amount_usd": totals_a,
-        }
-        check_row = cargo_total_check(doc_key, totals_from_doc, totals_calc)
+        totals_doc = {"qty": totals_qty, "gross_wt": totals_g, "net_wt": totals_n, "amount_usd": totals_a}
+        check_row = build_total_check_row(doc_key, cols, totals_doc, totals_calc)
 
         blocks[doc_key] = {
             "doc_label": doc_label,
             "cols": cols,
+            "cargo": cargo,
             "cargo_name": cargo_name,
             "hs": hs,
-            "detail_text": detail_text,
             "measurement": meas,
             "total_row": total_row,
             "check_row": check_row,
             "totals_calc": totals_calc,
         }
-
     return blocks
 
 
-def compute_cargo_mismatch_flags(blocks: Dict[str, Dict[str, Any]]) -> Dict[Tuple[str, str, str], bool]:
-    """
-    Flags for cargo cells to show RED text:
-      key: (row_name, doc_key, col_name) -> mismatch bool
-
-    Requirement #10: mismatch among same items across docs -> red text.
-    We apply it to:
-      - HS code (6 digit)
-      - Total row numeric cells (QTY, Gross, Net, Amount where applicable)
-    """
+def compute_cargo_flags(blocks: Dict[str, Dict[str, Any]]) -> Dict[Tuple[str, str, str], bool]:
     flags = {}
 
-    # HS mismatch (6-digit)
-    hs_vals = {}
-    for doc_key, _ in DOCS:
-        hs_vals[doc_key] = hs6(blocks[doc_key]["hs"])
-    non_empty_hs = [v for v in hs_vals.values() if v]
-    hs_mismatch = (len(set(non_empty_hs)) >= 2) if non_empty_hs else False
-    if hs_mismatch:
-        baseline = non_empty_hs[0]
+    # HS mismatch 6-digit
+    hs_vals = {doc_key: hs6(blocks[doc_key]["hs"]) for doc_key, _ in DOCS}
+    non_empty = [v for v in hs_vals.values() if v]
+    hs_mis = (len(set(non_empty)) >= 2) if non_empty else False
+    if hs_mis:
+        base = non_empty[0]
         for doc_key, _ in DOCS:
-            v = hs_vals[doc_key]
-            flags[("HS", doc_key, "Brand")] = (v != "" and v != baseline)
+            flags[("HS", doc_key, "Brand")] = (hs_vals[doc_key] != "" and hs_vals[doc_key] != base)
     else:
         for doc_key, _ in DOCS:
             flags[("HS", doc_key, "Brand")] = False
 
-    # Total row mismatches by column across docs (for shared metrics)
-    # Collect totals per metric (normalized)
-    metrics = ["QTY", "Gross WT (MT)", "Net WT (MT)", "Amount (USD)"]
-    for metric in metrics:
-        values = []
-        per_doc = {}
-        for doc_key, _ in DOCS:
-            cols = blocks[doc_key]["cols"]
-            if metric not in cols:
-                per_doc[doc_key] = ""
-                continue
-            v = norm_spaces(str(blocks[doc_key]["total_row"].get(metric, "")))
-            per_doc[doc_key] = v
-            if v:
-                values.append(v)
-
-        if len([v for v in values if v]) <= 1:
-            for doc_key, _ in DOCS:
-                flags[("Total", doc_key, metric)] = False
-            continue
-
-        # Compare numeric if possible
-        def norm_metric(m, s):
-            if m in ["Gross WT (MT)", "Net WT (MT)"]:
-                return to_float(s)
-            if m == "QTY":
-                return to_float(s)
-            if m == "Amount (USD)":
-                return to_float(s)
-            return s
-
-        normed = [norm_metric(metric, v) for v in values if v]
-        # If numeric compare:
-        if all(x is not None for x in normed):
-            baseline = normed[0]
-            for doc_key, _ in DOCS:
-                v = per_doc[doc_key]
-                if not v:
-                    flags[("Total", doc_key, metric)] = False
-                    continue
-                x = norm_metric(metric, v)
-                flags[("Total", doc_key, metric)] = (x is not None and abs(x - baseline) > 0.001)
-        else:
-            baseline = values[0]
-            for doc_key, _ in DOCS:
-                v = per_doc[doc_key]
-                flags[("Total", doc_key, metric)] = (v != "" and v != baseline)
-
-    # Total check row: if "no" then red (local flag)
+    # Total check row: show red if "no"
     for doc_key, _ in DOCS:
-        cols = blocks[doc_key]["cols"]
-        for c in cols:
+        for c in blocks[doc_key]["cols"]:
             v = norm_spaces(str(blocks[doc_key]["check_row"].get(c, ""))).lower()
             flags[("Check", doc_key, c)] = (v == "no")
 
@@ -759,7 +681,7 @@ def compute_cargo_mismatch_flags(blocks: Dict[str, Dict[str, Any]]) -> Dict[Tupl
 
 
 # =========================
-# HTML Rendering (no Styler)
+# HTML rendering (NO Styler)
 # =========================
 def html_escape(s: str) -> str:
     return (
@@ -773,9 +695,6 @@ def html_escape(s: str) -> str:
 
 
 def render_shipment_html(headers, rows, flags) -> str:
-    """
-    Simple HTML table, mismatch cells red.
-    """
     css = """
 <style>
 table.dc { border-collapse: collapse; width: 100%; table-layout: fixed; }
@@ -783,7 +702,6 @@ table.dc th, table.dc td { border: 1px solid #e5e7eb; padding: 8px; vertical-ali
 table.dc th { background: #f8fafc; font-weight: 600; }
 table.dc td.item { width: 220px; background: #fafafa; font-weight: 600; }
 .red { color: #dc2626; font-weight: 700; }
-.small { font-size: 12px; color: #6b7280; }
 </style>
 """
     h = [css, '<table class="dc">', "<thead><tr>"]
@@ -794,7 +712,7 @@ table.dc td.item { width: 220px; background: #fafafa; font-weight: 600; }
     for row_key, row_label, row_map in rows:
         h.append("<tr>")
         h.append(f'<td class="item">{html_escape(row_label)}</td>')
-        for doc_key, doc_label in DOCS:
+        for _, doc_label in DOCS:
             v = row_map.get(doc_label, "")
             is_red = flags.get((row_key, doc_label), False)
             cls = "red" if is_red else ""
@@ -807,28 +725,21 @@ table.dc td.item { width: 220px; background: #fafafa; font-weight: 600; }
 
 def render_cargo_html(blocks, cargo_flags) -> str:
     """
-    Cargo: one big table with multiheaders (documents each have different subcolumns).
-    Implements:
-      - Cargo detail merged (1 cell) with multiline
-      - Measurement row only BL
-      - Total / Total check row show only under specified columns (already blanked in data)
-      - Mismatch red text across docs (Requirement #10)
+    Two left columns: Group + Item
+    Only Group column is merged for Line1~Line5 (Cargo detail).
     """
     css = """
 <style>
 table.dc2 { border-collapse: collapse; width: 100%; table-layout: fixed; }
 table.dc2 th, table.dc2 td { border: 1px solid #e5e7eb; padding: 8px; vertical-align: top; font-size: 13px; }
 table.dc2 th { background: #f8fafc; font-weight: 700; text-align: center; }
-table.dc2 td.item { width: 220px; background: #fafafa; font-weight: 700; }
-table.dc2 td { word-wrap: break-word; }
+table.dc2 td.group { width: 140px; background: #fafafa; font-weight: 800; }
+table.dc2 td.item  { width: 180px; background: #fcfcfc; font-weight: 700; }
 .red { color: #dc2626; font-weight: 800; }
-pre.detail { margin: 0; white-space: pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size: 12px; }
 </style>
 """
-    # Build header rows:
-    # Row1: ITEM + each doc label spanning its subcolumns count
-    # Row2: subcolumns
-    r1 = ["<tr><th rowspan='2'>ITEM</th>"]
+
+    r1 = ["<tr><th rowspan='2'>Group</th><th rowspan='2'>Item</th>"]
     r2 = ["<tr>"]
     for doc_key, doc_label in DOCS:
         cols = blocks[doc_key]["cols"]
@@ -838,78 +749,82 @@ pre.detail { margin: 0; white-space: pre-wrap; font-family: ui-monospace, SFMono
     r1.append("</tr>")
     r2.append("</tr>")
 
-    # Rows
-    rows_html = []
-
-    def cell(doc_key, col, value, flag_key):
-        v = html_escape(value)
+    def td(flag_key: Tuple[str, str, str], value: str) -> str:
         is_red = cargo_flags.get(flag_key, False)
         cls = "red" if is_red else ""
-        return f'<td class="{cls}">{v}</td>'
+        return f'<td class="{cls}">{html_escape(value)}</td>'
 
-    # Cargo name row
+    rows_html = []
+
+    # Cargo name
     rows_html.append("<tr>")
+    rows_html.append('<td class="group"></td>')
     rows_html.append('<td class="item">Cargo name</td>')
     for doc_key, _ in DOCS:
         cols = blocks[doc_key]["cols"]
-        for i, c in enumerate(cols):
+        for c in cols:
             val = blocks[doc_key]["cargo_name"] if c == "Brand" else ""
-            rows_html.append(cell(doc_key, c, val, ("CargoName", doc_key, c)))
+            rows_html.append(td(("CargoName", doc_key, c), val))
     rows_html.append("</tr>")
 
-    # HS row
+    # HS
     rows_html.append("<tr>")
+    rows_html.append('<td class="group"></td>')
     rows_html.append('<td class="item">HS code / pos tarif</td>')
     for doc_key, _ in DOCS:
         cols = blocks[doc_key]["cols"]
         for c in cols:
             val = blocks[doc_key]["hs"] if c == "Brand" else ""
-            rows_html.append(cell(doc_key, c, val, ("HS", doc_key, "Brand")))
+            # red only when HS mismatch
+            key = ("HS", doc_key, "Brand") if c == "Brand" else ("HSx", doc_key, c)
+            rows_html.append(td(key, val))
     rows_html.append("</tr>")
 
-    # Cargo detail row (merged content in Brand column; other cols blank)
-    rows_html.append("<tr>")
-    rows_html.append('<td class="item">Cargo detail</td>')
-    for doc_key, _ in DOCS:
-        cols = blocks[doc_key]["cols"]
-        for c in cols:
-            if c == "Brand":
-                txt = blocks[doc_key]["detail_text"]
-                is_red = False  # not applying mismatch on detail lines for now
-                cls = "red" if is_red else ""
-                rows_html.append(f'<td class="{cls}"><pre class="detail">{html_escape(txt)}</pre></td>')
-            else:
-                rows_html.append('<td></td>')
-    rows_html.append("</tr>")
+    # Cargo detail (Group col merged only)
+    for i in range(CARGO_LINE_COUNT):
+        rows_html.append("<tr>")
+        if i == 0:
+            rows_html.append(f'<td class="group" rowspan="{CARGO_LINE_COUNT}">Cargo detail</td>')
+        rows_html.append(f'<td class="item">Line {i+1}</td>')
+        for doc_key, _ in DOCS:
+            cargo = blocks[doc_key]["cargo"]
+            cols = blocks[doc_key]["cols"]
+            for c in cols:
+                val = line_cell_value(doc_key, cargo, i, c)
+                rows_html.append(td(("Line", doc_key, c), val))
+        rows_html.append("</tr>")
 
-    # Measurement (CBM) row
+    # Measurement
     rows_html.append("<tr>")
+    rows_html.append('<td class="group"></td>')
     rows_html.append('<td class="item">Measurement (CBM)</td>')
     for doc_key, _ in DOCS:
         cols = blocks[doc_key]["cols"]
         for c in cols:
             val = blocks[doc_key]["measurement"] if c == "Brand" else ""
-            rows_html.append(cell(doc_key, c, val, ("CBM", doc_key, c)))
+            rows_html.append(td(("CBM", doc_key, c), val))
     rows_html.append("</tr>")
 
-    # Total row
+    # Total (doc totals 그대로)
     rows_html.append("<tr>")
+    rows_html.append('<td class="group"></td>')
     rows_html.append('<td class="item">Total</td>')
     for doc_key, _ in DOCS:
         cols = blocks[doc_key]["cols"]
         for c in cols:
             val = norm_spaces(str(blocks[doc_key]["total_row"].get(c, "")))
-            rows_html.append(cell(doc_key, c, val, ("Total", doc_key, c)))
+            rows_html.append(td(("Total", doc_key, c), val))
     rows_html.append("</tr>")
 
-    # Total check row
+    # Total check (ok black, no red)
     rows_html.append("<tr>")
+    rows_html.append('<td class="group"></td>')
     rows_html.append('<td class="item">Total check</td>')
     for doc_key, _ in DOCS:
         cols = blocks[doc_key]["cols"]
         for c in cols:
             val = norm_spaces(str(blocks[doc_key]["check_row"].get(c, "")))
-            rows_html.append(cell(doc_key, c, val, ("Check", doc_key, c)))
+            rows_html.append(td(("Check", doc_key, c), val))
     rows_html.append("</tr>")
 
     html = "\n".join(
@@ -925,7 +840,7 @@ pre.detail { margin: 0; white-space: pre-wrap; font-family: ui-monospace, SFMono
 # =========================
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
-st.caption("Upload is minimized at top-right. Tables are rendered as HTML for stability (no pandas Styler).")
+st.caption("Upload is minimized at top-right. Tables are rendered as HTML (no pandas Styler).")
 
 top_left, top_right = st.columns([3.5, 1.5], gap="small")
 
@@ -945,8 +860,6 @@ with top_right:
 # Always create extracted dict (even if missing)
 extracted: Dict[str, Any] = {}
 errors: List[str] = []
-
-# Default empty payloads
 for doc_key, _ in DOCS:
     extracted[doc_key] = {"shipment": {}, "cargo": {}}
 
@@ -959,7 +872,7 @@ if run:
             for doc_key, doc_label in DOCS:
                 f = uploaded.get(doc_key)
                 if not f:
-                    continue  # keep empty
+                    continue
                 try:
                     text = pdf_to_text(f)
                     if not text:
@@ -972,21 +885,18 @@ if run:
                         continue
                     extracted[doc_key] = obj
                 except Exception as e:
-                    errors.append(f"[{doc_label}] {type(e)._name_}: {str(e)[:200]}")
+                    errors.append(f"[{doc_label}] {type(e).__name__}: {str(e)[:200]}")
 
-# Build shipment
+# Build views (always show tables even if no uploads)
 ship_headers, ship_rows = build_shipment_matrix(extracted)
-ship_flags = compute_shipment_mismatch_flags(ship_rows, ignore_doc_number=True)
+ship_flags = compute_shipment_mismatch_flags(ship_rows)
 
-# Build cargo
 cargo_blocks = build_cargo_blocks(extracted)
-cargo_flags = compute_cargo_mismatch_flags(cargo_blocks)
+cargo_flags = compute_cargo_flags(cargo_blocks)
 
-# KPI
-docs_uploaded_count = sum(1 for k, _ in DOCS if uploaded.get(k))
 st.divider()
 k1, k2, k3, k4 = st.columns(4)
-# shipment mismatch count
+docs_uploaded_count = sum(1 for k, _ in DOCS if uploaded.get(k))
 ship_mis_count = sum(1 for (rk, dl), v in ship_flags.items() if v and rk != "document_number")
 k1.metric("Shipment mismatches", ship_mis_count)
 k2.metric("HS mismatch (6-digit)", "YES" if any(cargo_flags.get(("HS", dk, "Brand"), False) for dk, _ in DOCS) else "NO")
@@ -998,7 +908,6 @@ if errors:
         for e in errors:
             st.error(e)
 
-# Render tables
 st.subheader("Shipment Information")
 st.markdown(render_shipment_html(ship_headers, ship_rows, ship_flags), unsafe_allow_html=True)
 
@@ -1008,11 +917,13 @@ st.markdown(render_cargo_html(cargo_blocks, cargo_flags), unsafe_allow_html=True
 st.divider()
 st.caption(
     "Applied rules: "
-    "BL/SWB PLB operator is always blank. "
+    "Doc number mismatch is ignored. "
     "POL compares city only. POD compares city only and treats Jakarta as Tanjung Priok. "
+    "Vessel/Voy compares by ignoring punctuation; 'KMTC HOCHIMINH' + '2510S' is treated as equivalent. "
+    "Container type/amount shows quantity only (container number => 1). "
     "HS comparison ignores punctuation and matches first 6 digits. "
     "KG is converted to MT. "
-    "Total/QTY missing in documents are calculated from line items. "
-    "For Indonesian source text (e.g., BC 1.6), values are translated/normalized into English. "
-    "Mismatched cells are shown in red text."
+    "Total row shows document totals as-is. "
+    "Total check compares sum(line items) vs document totals; ok=black, no=red. "
+    "For Indonesian source text (e.g., BC 1.6), values are translated/normalized into English."
 )
