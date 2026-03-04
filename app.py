@@ -4,6 +4,7 @@ import json
 import time
 import hashlib
 from typing import Dict, Any, Tuple, List, Optional
+from collections import Counter
 
 import certifi
 import httpx
@@ -14,7 +15,7 @@ from openai import OpenAI
 # =========================
 # App config
 # =========================
-APP_TITLE = "Doc Checker PoC — Shipment & Cargo Compare (auto-detect, single upload)"
+APP_TITLE = "Doc Checker PoC — Shipment & Cargo Compare (Cargo Summary v2)"
 MODEL = "gpt-4.1-mini"
 
 DOCS = [
@@ -39,18 +40,17 @@ SHIPMENT_ROWS = [
     ("container_40", "Container type / amount (40')"),
 ]
 
-CARGO_LINE_COUNT = 5  # Line 1~5
-
-# Column rules per doc:
-# - BL/SWB & Packing List: remove Amount + Code
-# - Proforma: remove Code
-# - BC 1.6: keep Amount + Code
-DOC_COLS = {
-    "BL_SWB": ["Brand", "Packing", "QTY", "Gross WT (MT)", "Net WT (MT)"],
-    "PACKING_LIST": ["Brand", "Packing", "QTY", "Gross WT (MT)", "Net WT (MT)"],
-    "PROFORMA_INVOICE": ["Brand", "Packing", "QTY", "Gross WT (MT)", "Net WT (MT)", "Amount (USD)"],
-    "CUSTOMS_BC16": ["Brand", "Packing", "QTY", "Gross WT (MT)", "Net WT (MT)", "Amount (USD)", "Code"],
-}
+# Cargo Summary 8 fields (UI only)
+CARGO_SUMMARY_ROWS = [
+    ("cargo_name", "Cargo name"),
+    ("hs6", "HS code (6-digit)"),
+    ("packing_type", "Packing type"),
+    ("total_bundles", "Total bundles"),
+    ("total_pcs", "Total quantity (PCS)"),
+    ("gross_mt", "Total Gross WT (MT)"),
+    ("net_mt", "Total Net WT (MT)"),
+    ("measurement_cbm", "Measurement (CBM)"),
+]
 
 MAX_TEXT_CHARS = 12000
 
@@ -177,6 +177,11 @@ def to_float(s: str) -> Optional[float]:
 
 
 def to_mt(value: str) -> str:
+    """
+    KOR:
+    - KG면 /1000 해서 MT로 통일
+    - 소수점 3자리까지 표준화 표시 (뒤 0 제거)
+    """
     s = norm_spaces(value)
     if not s:
         return ""
@@ -191,7 +196,14 @@ def to_mt(value: str) -> str:
         return s
     if "kg" in low:
         x = x / 1000.0
+    # 표시는 3자리까지, 뒤 0 제거
     return f"{x:.3f}".rstrip("0").rstrip(".")
+
+
+def round3_str(num: Optional[float]) -> str:
+    if num is None:
+        return ""
+    return f"{round(num, 3):.3f}".rstrip("0").rstrip(".")
 
 
 def vessel_key(v: str) -> str:
@@ -217,7 +229,7 @@ def container_qty_only(v: str) -> str:
     If it looks like a container number (e.g., TEMU0373972), treat as qty=1.
 
     KOR:
-    - "0"은 표시하지 않고 빈칸 반환 (요청 반영)
+    - "0"은 표시하지 않고 빈칸 반환
     """
     s = norm_spaces(v)
     if not s:
@@ -262,83 +274,96 @@ def loose_text_key(v: str) -> str:
     return s
 
 
-# =========================
-# Cargo line mismatch helpers
-# =========================
-def norm_text_for_compare(v: str) -> str:
+def norm_text_strict_key(v: str) -> str:
+    """
+    KOR:
+    Cargo name 비교용: 소문자 + 기호 제거 + 중복공백 제거 (철자는 느슨하게 처리하지 않음)
+    """
     s = norm_spaces(v).lower()
-    s = re.sub(r"[^\w\s]", "", s)
+    s = re.sub(r"[^\w\s]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
 
-def norm_packing_for_compare(v: str) -> str:
+def packing_type_key(v: str) -> str:
     """
-    - '1 BUNDLE'과 'BUNDLE' 동일 취급 (선행 숫자 제거)
-    - bundles -> bundle
+    KOR:
+    Packing type 비교용: 소문자 + 복수형 통일
+    - bundles == bundle
+    - pcs == pc
+    - pieces == pc
+    - piece == pc
     """
     s = norm_spaces(v).lower()
-    s = re.sub(r"^\d+\s+", "", s)
+    s = re.sub(r"^\d+\s+", "", s)  # "1 BUNDLE" -> "BUNDLE"
+    s = re.sub(r"[^\w\s]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+
+    # 단순 통일 (과도 확장 금지)
+    if s in ("bundles", "bundle"):
+        return "bundle"
+    if s in ("pcs", "pc", "piece", "pieces"):
+        return "pc"
+
+    # 흔한 변형: "bundle(s)"처럼 괄호
     s = s.replace("bundles", "bundle")
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
+    s = s.replace("pcs", "pc")
+    s = s.replace("pieces", "pc")
+    s = s.replace("piece", "pc")
+
+    # 마지막으로 단어 하나만 남기기 (packing type은 보통 단어 1~2개)
+    toks = s.split()
+    if len(toks) == 0:
+        return ""
+    if len(toks) == 1:
+        return toks[0]
+    # "big bag" 같은 경우는 2단어 유지
+    return " ".join(toks[:2])
 
 
-def value_key_for_line_compare(col: str, raw: str) -> Tuple[str, Optional[float], str]:
-    if col in ("Gross WT (MT)", "Net WT (MT)"):
-        f = to_float(raw)
-        return ("num", f, "")
-    if col == "Amount (USD)":
-        f = to_float(raw)
-        return ("num", f, "")
-    if col == "QTY":
-        f = to_float(raw)
-        return ("num", f, "")
-    if col == "Packing":
-        return ("text", None, norm_packing_for_compare(raw))
-    return ("text", None, norm_text_for_compare(raw))
-
-
-def is_line_cell_mismatch(values_by_doc: Dict[str, str], col: str, tol: float = 0.002) -> Dict[str, bool]:
+def int_only_str(v: str) -> str:
     """
-    - 동일 line index(Line1끼리)에서 각 서류의 같은 컬럼 값 비교
-    - 빈 값은 제외
-    - 값이 2개 이상 있을 때 서로 다르면 mismatch
-    - 숫자는 tol 허용오차
+    KOR:
+    Total bundles/pcs 비교용: 숫자만 추출하여 정수로 표시
     """
-    present = {dk: v for dk, v in values_by_doc.items() if norm_spaces(v)}
-    if len(present) <= 1:
-        return {dk: False for dk in values_by_doc.keys()}
+    f = to_float(v)
+    if f is None:
+        return ""
+    return str(int(round(f)))
 
-    keys = {}
-    for dk, v in present.items():
-        kind, num, txt = value_key_for_line_compare(col, v)
-        keys[dk] = (kind, num, txt)
 
-    base_dk = next(iter(present.keys()))
-    base_kind, base_num, base_txt = keys[base_dk]
+def cbm_key(v: str) -> str:
+    """
+    KOR:
+    CBM 비교: 숫자 비교 + 소수점 셋째자리 반올림(표준화)
+    """
+    f = to_float(v)
+    if f is None:
+        return ""
+    return round3_str(f)
 
-    mismatch_map = {dk: False for dk in values_by_doc.keys()}
 
-    for dk in present.keys():
-        kind, num, txt = keys[dk]
-
-        if kind != base_kind:
-            mismatch_map[dk] = True
-            continue
-
-        if kind == "num":
-            if base_num is None or num is None:
-                mismatch_map[dk] = (norm_spaces(present[dk]) != norm_spaces(present[base_dk]))
-            else:
-                mismatch_map[dk] = (abs(num - base_num) > tol)
-        else:
-            mismatch_map[dk] = (txt != base_txt)
-
-    if not any(mismatch_map.values()):
-        mismatch_map = {dk: False for dk in mismatch_map.keys()}
-
-    return mismatch_map
+def mt_key(v: str) -> str:
+    """
+    KOR:
+    MT 비교: KG면 /1000 후, 소수점 셋째자리 반올림(표준화)
+    """
+    # to_mt는 문자열 표준화(표시 목적)라서, 비교는 float 기반으로 다시 계산
+    s = norm_spaces(v)
+    if not s:
+        return ""
+    low = s.lower()
+    nums = re.findall(r"[-+]?\d[\d,]*\.?\d*", low)
+    if not nums:
+        return ""
+    n = nums[0].replace(",", "")
+    try:
+        x = float(n)
+    except Exception:
+        return ""
+    if "kg" in low:
+        x = x / 1000.0
+    return round3_str(x)
 
 
 # =========================
@@ -379,7 +404,8 @@ def classify_page(text: str) -> Optional[str]:
         return "PACKING_LIST"
 
     # --- Invoice ---
-    if "invoice" in t:
+    # 오타 대응 포함: "nvoice" 등
+    if "invoice" in t or "nvoice" in t:
         return "PROFORMA_INVOICE"
 
     return None
@@ -616,292 +642,275 @@ def compute_shipment_mismatch_flags(rows) -> Dict[Tuple[str, str], bool]:
 
 
 # =========================
-# Cargo building
+# Cargo Summary (UI v2)
+# - Line1~Line5 제거 (UI만)
+# - Total / Total check 제거 (UI만)
+# - 추출(line_items) 로직은 유지
 # =========================
-def get_line_item(cargo: dict, idx: int) -> dict:
+def get_cargo(payload: dict) -> dict:
+    cargo = payload.get("cargo", {}) if isinstance(payload, dict) else {}
+    return cargo if isinstance(cargo, dict) else {}
+
+
+def get_line_items(cargo: dict) -> List[dict]:
     li = cargo.get("line_items", []) if isinstance(cargo, dict) else []
     if not isinstance(li, list):
-        return {}
-    if idx < 0 or idx >= len(li):
-        return {}
-    it = li[idx]
-    return it if isinstance(it, dict) else {}
-
-
-def line_cell_value(doc_key: str, cargo: dict, line_idx: int, col: str) -> str:
-    it = get_line_item(cargo, line_idx)
-
-    brand = norm_spaces(str(it.get("brand", "")))
-    packing = norm_spaces(str(it.get("packing", "")))
-    qty = norm_spaces(str(it.get("qty", "")))
-    gross = to_mt(str(it.get("gross_wt", "")))
-    net = to_mt(str(it.get("net_wt", "")))
-    amt = norm_spaces(str(it.get("amount_usd", "")))
-    code = norm_spaces(str(it.get("code", "")))
-
-    # Invoice: treat WT as NET if gross filled but net empty
-    if doc_key == "PROFORMA_INVOICE":
-        if gross and not net:
-            net = gross
-            gross = ""
-
-    # BC 1.6 Gross WT should not appear per line (total only)
-    if doc_key == "CUSTOMS_BC16" and col == "Gross WT (MT)":
-        return ""
-
-    if col == "Brand":
-        return brand
-    if col == "Packing":
-        return packing
-    if col == "QTY":
-        return qty
-    if col == "Gross WT (MT)":
-        return gross
-    if col == "Net WT (MT)":
-        return net
-    if col == "Amount (USD)":
-        return amt
-    if col == "Code":
-        return code
-    return ""
-
-
-def compute_totals_from_lines(doc_key: str, cargo: dict) -> Dict[str, str]:
-    li = cargo.get("line_items", []) if isinstance(cargo, dict) else []
-    if not isinstance(li, list):
-        li = []
-
-    qty_sum = 0.0
-    gross_sum = 0.0
-    net_sum = 0.0
-    amt_sum = 0.0
-    has_any = False
-
+        return []
+    out = []
     for it in li:
-        if not isinstance(it, dict):
+        if isinstance(it, dict):
+            out.append(it)
+    return out
+
+
+def invoice_net_rule(gross: Optional[float], net: Optional[float]) -> Tuple[Optional[float], Optional[float]]:
+    """
+    Invoice rule:
+    - If only one weight exists per line and it is placed in gross, treat it as net.
+    """
+    if gross is not None and net is None:
+        return None, gross
+    return gross, net
+
+
+def sum_qty_by_packing(line_items: List[dict], target_pack_key: str) -> Optional[float]:
+    """
+    KOR:
+    - packing_type_key(packing) == target_pack_key 인 라인만 qty 합산
+    - qty가 숫자형으로 파싱될 때만 합산
+    """
+    s = 0.0
+    has = False
+    for it in line_items:
+        p = packing_type_key(str(it.get("packing", "")))
+        if not p or p != target_pack_key:
             continue
         q = to_float(str(it.get("qty", "")))
-        g = to_float(to_mt(str(it.get("gross_wt", ""))))
-        n = to_float(to_mt(str(it.get("net_wt", ""))))
-        a = to_float(str(it.get("amount_usd", "")))
+        if q is None:
+            continue
+        s += q
+        has = True
+    return s if has else None
+
+
+def sum_weights_from_lines(doc_key: str, line_items: List[dict]) -> Tuple[Optional[float], Optional[float]]:
+    """
+    Returns (gross_mt_sum, net_mt_sum) as floats (MT).
+    KOR:
+    - gross/net 값이 KG면 /1000
+    - Invoice는 gross만 있으면 net으로 이동
+    """
+    g_sum = 0.0
+    n_sum = 0.0
+    g_has = False
+    n_has = False
+
+    for it in line_items:
+        g_raw = str(it.get("gross_wt", ""))
+        n_raw = str(it.get("net_wt", ""))
+
+        # parse gross
+        g_num = None
+        if norm_spaces(g_raw):
+            gk = mt_key(g_raw)
+            g_num = to_float(gk) if gk else None
+
+        # parse net
+        n_num = None
+        if norm_spaces(n_raw):
+            nk = mt_key(n_raw)
+            n_num = to_float(nk) if nk else None
 
         if doc_key == "PROFORMA_INVOICE":
-            if g is not None and n is None:
-                n = g
-                g = None
+            g_num, n_num = invoice_net_rule(g_num, n_num)
 
-        if any(x is not None for x in [q, g, n, a]):
-            has_any = True
+        if g_num is not None:
+            g_sum += g_num
+            g_has = True
+        if n_num is not None:
+            n_sum += n_num
+            n_has = True
 
-        if q is not None:
-            qty_sum += q
-        if g is not None:
-            gross_sum += g
-        if n is not None:
-            net_sum += n
-        if a is not None:
-            amt_sum += a
-
-    if not has_any:
-        return {"qty": "", "gross": "", "net": "", "amt": ""}
-
-    return {
-        "qty": f"{qty_sum:.0f}" if qty_sum.is_integer() else str(qty_sum),
-        "gross": f"{gross_sum:.3f}".rstrip("0").rstrip(".") if gross_sum else "",
-        "net": f"{net_sum:.3f}".rstrip("0").rstrip(".") if net_sum else "",
-        "amt": f"{amt_sum:.2f}".rstrip("0").rstrip(".") if amt_sum else "",
-    }
+    return (g_sum if g_has else None, n_sum if n_has else None)
 
 
-def build_total_check_row(
-    doc_key: str,
-    cols: List[str],
-    totals_doc: Dict[str, str],
-    totals_calc: Dict[str, str],
-) -> Dict[str, str]:
+def dominant_packing_type(line_items: List[dict]) -> str:
     """
-    Total row = doc totals (unchanged).
-    Total check compares (sum of line items) vs (doc totals).
-    - ok in black
-    - no in red
-    If doc total is blank => check cell blank.
+    KOR:
+    - packing type 후보를 normalize해서 가장 많이 나온 값을 선택
     """
-    def close(a: Optional[float], b: Optional[float], tol=0.001) -> bool:
-        if a is None or b is None:
-            return False
-        return abs(a - b) <= tol
-
-    def decide(doc_val: str, calc_val: str) -> str:
-        if not norm_spaces(doc_val):
-            return ""
-        da = to_float(doc_val)
-        cb = to_float(calc_val)
-        if da is None or cb is None:
-            return "ok" if norm_spaces(doc_val) == norm_spaces(calc_val) else "no"
-        return "ok" if close(da, cb) else "no"
-
-    show = {c: "" for c in cols}
-
-    if doc_key in ["BL_SWB", "PACKING_LIST"]:
-        if "QTY" in cols:
-            show["QTY"] = decide(totals_doc.get("qty", ""), totals_calc.get("qty", ""))
-        if "Gross WT (MT)" in cols:
-            show["Gross WT (MT)"] = decide(totals_doc.get("gross_wt", ""), totals_calc.get("gross", ""))
-        if "Net WT (MT)" in cols:
-            show["Net WT (MT)"] = decide(totals_doc.get("net_wt", ""), totals_calc.get("net", ""))
-    elif doc_key == "PROFORMA_INVOICE":
-        if "QTY" in cols:
-            show["QTY"] = decide(totals_doc.get("qty", ""), totals_calc.get("qty", ""))
-        if "Net WT (MT)" in cols:
-            show["Net WT (MT)"] = decide(totals_doc.get("net_wt", ""), totals_calc.get("net", ""))
-        if "Amount (USD)" in cols:
-            show["Amount (USD)"] = decide(totals_doc.get("amount_usd", ""), totals_calc.get("amt", ""))
-    elif doc_key == "CUSTOMS_BC16":
-        if "QTY" in cols:
-            show["QTY"] = decide(totals_doc.get("qty", ""), totals_calc.get("qty", ""))
-        if "Gross WT (MT)" in cols:
-            show["Gross WT (MT)"] = decide(totals_doc.get("gross_wt", ""), totals_calc.get("gross", ""))
-        if "Net WT (MT)" in cols:
-            show["Net WT (MT)"] = decide(totals_doc.get("net_wt", ""), totals_calc.get("net", ""))
-        if "Amount (USD)" in cols:
-            show["Amount (USD)"] = decide(totals_doc.get("amount_usd", ""), totals_calc.get("amt", ""))
-
-    return show
+    keys = []
+    for it in line_items:
+        pk = packing_type_key(str(it.get("packing", "")))
+        if pk:
+            keys.append(pk)
+    if not keys:
+        return ""
+    c = Counter(keys)
+    return c.most_common(1)[0][0]
 
 
-def build_cargo_blocks(extracted: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
-    blocks = {}
-    for doc_key, doc_label in DOCS:
-        payload = extracted.get(doc_key, {})
-        cargo = payload.get("cargo", {}) if isinstance(payload, dict) else {}
-        if not isinstance(cargo, dict):
-            cargo = {}
-
-        cols = DOC_COLS[doc_key]
-
-        cargo_name = norm_spaces(str(cargo.get("cargo_name", "")))
-        hs = norm_spaces(str(cargo.get("hs_code", "")))
-        meas = norm_spaces(str(cargo.get("measurement_cbm", "")))
-
-        if doc_key != "BL_SWB":
-            meas = ""
-
-        totals = cargo.get("totals", {}) if isinstance(cargo, dict) else {}
-        if not isinstance(totals, dict):
-            totals = {}
-
-        totals_qty = norm_spaces(str(totals.get("qty", "")))
-        totals_g = to_mt(str(totals.get("gross_wt", "")))
-        totals_n = to_mt(str(totals.get("net_wt", "")))
-        totals_a = norm_spaces(str(totals.get("amount_usd", "")))
-
-        if doc_key == "PROFORMA_INVOICE":
-            if totals_g and not totals_n:
-                totals_n = totals_g
-                totals_g = ""
-
-        if doc_key in ["BL_SWB", "PACKING_LIST"]:
-            totals_a = ""
-
-        totals_calc = compute_totals_from_lines(doc_key, cargo)
-
-        total_row = {c: "" for c in cols}
-        if "QTY" in cols:
-            total_row["QTY"] = totals_qty
-        if "Gross WT (MT)" in cols:
-            total_row["Gross WT (MT)"] = totals_g if doc_key != "PROFORMA_INVOICE" else ""
-        if "Net WT (MT)" in cols:
-            total_row["Net WT (MT)"] = totals_n
-        if "Amount (USD)" in cols:
-            total_row["Amount (USD)"] = totals_a
-        if "Brand" in cols:
-            total_row["Brand"] = ""
-        if "Packing" in cols:
-            total_row["Packing"] = ""
-        if "Code" in cols:
-            total_row["Code"] = ""
-
-        totals_doc = {"qty": totals_qty, "gross_wt": totals_g, "net_wt": totals_n, "amount_usd": totals_a}
-        check_row = build_total_check_row(doc_key, cols, totals_doc, totals_calc)
-
-        blocks[doc_key] = {
-            "doc_label": doc_label,
-            "cols": cols,
-            "cargo": cargo,
-            "cargo_name": cargo_name,
-            "hs": hs,
-            "measurement": meas,
-            "total_row": total_row,
-            "check_row": check_row,
-        }
-    return blocks
-
-
-def compute_cargo_flags(
-    blocks: Dict[str, Dict[str, Any]],
-    bc16_shipper: str,
-    bc16_cargo_owner: str,
-) -> Dict[Tuple[str, str, str], bool]:
+def build_cargo_summary_matrix(extracted: Dict[str, Any]) -> Tuple[List[str], List[Tuple[str, str, Dict[str, str]]]]:
     """
-    Flags key convention used by renderer:
-      ("HS", doc_key, "Brand") for HS row (Brand column)
-      ("Check", doc_key, col) for total-check row
-      (f"Line{n}", doc_key, col) for line-cell mismatch (Line1~5)
-      (f"Line{n}", "CUSTOMS_BC16", "Code") can also be forced red by TIP-rule
+    Returns:
+    - headers: ["ITEM", "BL / SWB", "Packing List", "Proforma Invoice", "Customs BC 1.6"]
+    - rows: (row_key, row_label, {doc_label: display_value})
     """
-    flags: Dict[Tuple[str, str, str], bool] = {}
+    headers = ["ITEM"] + [label for _, label in DOCS]
+    rows: List[Tuple[str, str, Dict[str, str]]] = []
 
-    # 1) HS mismatch (6-digit) -> mark HS row Brand cell red
-    hs_vals = {doc_key: hs6(blocks[doc_key]["hs"]) for doc_key, _ in DOCS}
-    non_empty = [v for v in hs_vals.values() if v]
-    hs_mis = (len(set(non_empty)) >= 2) if non_empty else False
-    if hs_mis:
-        base = non_empty[0]
-        for doc_key, _ in DOCS:
-            flags[("HS", doc_key, "Brand")] = (hs_vals[doc_key] != "" and hs_vals[doc_key] != base)
-    else:
-        for doc_key, _ in DOCS:
-            flags[("HS", doc_key, "Brand")] = False
+    for row_key, row_label in CARGO_SUMMARY_ROWS:
+        row_map: Dict[str, str] = {}
 
-    # 2) Total check row: red only when "no"
-    for doc_key, _ in DOCS:
-        for c in blocks[doc_key]["cols"]:
-            v = norm_spaces(str(blocks[doc_key]["check_row"].get(c, ""))).lower()
-            flags[("Check", doc_key, c)] = (v == "no")
+        for doc_key, doc_label in DOCS:
+            payload = extracted.get(doc_key, {})
+            cargo = get_cargo(payload)
+            line_items = get_line_items(cargo)
 
-    # 3) Cargo line mismatch (Line1~Line5) cell-level
-    all_cols = set()
-    for doc_key, _ in DOCS:
-        for c in blocks[doc_key]["cols"]:
-            all_cols.add(c)
+            cargo_name = norm_spaces(str(cargo.get("cargo_name", "")))
+            hs = norm_spaces(str(cargo.get("hs_code", "")))
+            meas = norm_spaces(str(cargo.get("measurement_cbm", "")))
 
-    for line_idx in range(CARGO_LINE_COUNT):
-        for col in sorted(all_cols):
-            values_by_doc: Dict[str, str] = {}
-            for doc_key, _ in DOCS:
-                if col not in blocks[doc_key]["cols"]:
-                    values_by_doc[doc_key] = ""
-                    continue
-                cargo = blocks[doc_key]["cargo"]
-                values_by_doc[doc_key] = line_cell_value(doc_key, cargo, line_idx, col)
+            # 기존 로직 유지: BL/SWB만 measurement 보이도록
+            if doc_key != "BL_SWB":
+                meas = ""
 
-            mis_map = is_line_cell_mismatch(values_by_doc, col)
-            for doc_key, _ in DOCS:
-                flags[(f"Line{line_idx+1}", doc_key, col)] = bool(mis_map.get(doc_key, False))
+            # totals(문서 내 totals) - 있으면 활용, 없으면 line_items로 보정
+            totals = cargo.get("totals", {}) if isinstance(cargo, dict) else {}
+            totals = totals if isinstance(totals, dict) else {}
 
-    # 4) TIP rule (Customs BC 1.6 Code)
-    shipper_k = loose_text_key(bc16_shipper)
-    owner_k = loose_text_key(bc16_cargo_owner)
-    tip_should_be_red = bool(owner_k) and (owner_k == shipper_k)
+            totals_qty_raw = norm_spaces(str(totals.get("qty", "")))
+            totals_g_raw = norm_spaces(str(totals.get("gross_wt", "")))
+            totals_n_raw = norm_spaces(str(totals.get("net_wt", "")))
 
-    if tip_should_be_red:
-        doc_key = "CUSTOMS_BC16"
-        if "Code" in blocks[doc_key]["cols"]:
-            cargo = blocks[doc_key]["cargo"]
-            for line_idx in range(CARGO_LINE_COUNT):
-                code_val = line_cell_value(doc_key, cargo, line_idx, "Code")
-                if norm_spaces(code_val).lower() == "tip":
-                    flags[(f"Line{line_idx+1}", doc_key, "Code")] = True
+            # packing type
+            pack_dom = dominant_packing_type(line_items)  # normalized key
+            pack_disp = pack_dom.upper() if pack_dom else ""
+
+            # total bundles / pcs (line_items 기반)
+            bundles_sum = sum_qty_by_packing(line_items, "bundle")
+            pcs_sum = sum_qty_by_packing(line_items, "pc")
+
+            # 보조: line_items에서 못구하면 totals.qty라도 표시 (단위 구분이 안되므로 bundles에만 fallback)
+            bundles_disp = ""
+            if bundles_sum is not None:
+                bundles_disp = str(int(round(bundles_sum)))
+            elif totals_qty_raw:
+                bundles_disp = int_only_str(totals_qty_raw)
+
+            pcs_disp = ""
+            if pcs_sum is not None:
+                pcs_disp = str(int(round(pcs_sum)))
+
+            # weights: totals 우선, 없으면 line_items 합계
+            gross_disp = to_mt(totals_g_raw) if totals_g_raw else ""
+            net_disp = to_mt(totals_n_raw) if totals_n_raw else ""
+
+            if doc_key == "PROFORMA_INVOICE":
+                # Invoice totals도 gross만 있으면 net으로 이동
+                if gross_disp and not net_disp:
+                    net_disp = gross_disp
+                    gross_disp = ""
+
+            if (not gross_disp) and (not net_disp):
+                g_sum, n_sum = sum_weights_from_lines(doc_key, line_items)
+                gross_disp = round3_str(g_sum) if g_sum is not None and doc_key != "PROFORMA_INVOICE" else ""
+                net_disp = round3_str(n_sum) if n_sum is not None else ""
+
+            # measurement display: 숫자만 표시 (원본이 'xx CBM'이면 숫자만 보이게)
+            meas_disp = ""
+            if meas:
+                f = to_float(meas)
+                meas_disp = round3_str(f) if f is not None else meas
+
+            # HS display: 원문 유지(표시), 비교는 hs6로
+            if row_key == "cargo_name":
+                val = cargo_name
+            elif row_key == "hs6":
+                val = hs
+            elif row_key == "packing_type":
+                val = pack_disp
+            elif row_key == "total_bundles":
+                val = bundles_disp
+            elif row_key == "total_pcs":
+                val = pcs_disp
+            elif row_key == "gross_mt":
+                val = gross_disp
+            elif row_key == "net_mt":
+                val = net_disp
+            elif row_key == "measurement_cbm":
+                val = meas_disp
+            else:
+                val = ""
+
+            row_map[doc_label] = norm_spaces(val)
+
+        rows.append((row_key, row_label, row_map))
+
+    return headers, rows
+
+
+def cargo_value_for_compare(row_key: str, display_value: str) -> str:
+    """
+    KOR:
+    - 표시값이 아니라 비교용 정규화 값으로 비교
+    - 빈 값은 제외
+    - 값이 2개 이상 존재할 때만 비교
+    """
+    v = norm_spaces(display_value)
+    if not v:
+        return ""
+
+    if row_key == "cargo_name":
+        return norm_text_strict_key(v)
+
+    if row_key == "hs6":
+        return hs6(v)
+
+    if row_key == "packing_type":
+        return packing_type_key(v)
+
+    if row_key in ("total_bundles", "total_pcs"):
+        return int_only_str(v)
+
+    if row_key in ("gross_mt", "net_mt"):
+        return mt_key(v)
+
+    if row_key == "measurement_cbm":
+        return cbm_key(v)
+
+    return norm_text_strict_key(v)
+
+
+def compute_cargo_summary_mismatch_flags(rows: List[Tuple[str, str, Dict[str, str]]]) -> Dict[Tuple[str, str], bool]:
+    """
+    Same principle as Shipment:
+    - 빈 값 제외
+    - 값 2개 이상일 때만 비교
+    - 다르면 해당 셀 red
+    """
+    flags: Dict[Tuple[str, str], bool] = {}
+
+    for row_key, _row_label, row_map in rows:
+        comps = []
+        for _, doc_label in DOCS:
+            comps.append(cargo_value_for_compare(row_key, row_map.get(doc_label, "")))
+
+        non_empty = [c for c in comps if c]
+        if len(non_empty) <= 1:
+            for _, doc_label in DOCS:
+                flags[(row_key, doc_label)] = False
+            continue
+
+        mismatch = (len(set(non_empty)) >= 2)
+        if mismatch:
+            baseline = non_empty[0]
+            for idx, (_, doc_label) in enumerate(DOCS):
+                c = comps[idx]
+                flags[(row_key, doc_label)] = (c != "" and c != baseline)
+        else:
+            for _, doc_label in DOCS:
+                flags[(row_key, doc_label)] = False
 
     return flags
 
@@ -920,7 +929,7 @@ def html_escape(s: str) -> str:
     )
 
 
-def render_shipment_html(headers, rows, flags) -> str:
+def render_simple_compare_html(headers, rows, flags) -> str:
     css = """
 <style>
 .scrollx { overflow-x: auto; width: 100%; }
@@ -930,7 +939,7 @@ table.dc th, table.dc td {
   white-space: nowrap;
 }
 table.dc th { background: #f8fafc; font-weight: 600; }
-table.dc td.item { width: 220px; background: #fafafa; font-weight: 600; }
+table.dc td.item { width: 240px; background: #fafafa; font-weight: 600; }
 .red { color: #dc2626; font-weight: 700; }
 </style>
 """
@@ -953,127 +962,16 @@ table.dc td.item { width: 220px; background: #fafafa; font-weight: 600; }
     return "\n".join(h)
 
 
-def render_cargo_html(blocks, cargo_flags) -> str:
-    """
-    Two left columns: Group + Item
-    Only Group column is merged for Line1~Line5 (Cargo detail).
-    """
-    css = """
-<style>
-.scrollx { overflow-x: auto; width: 100%; }
-table.dc2 { border-collapse: collapse; width: max-content; min-width: 100%; }
-table.dc2 th, table.dc2 td {
-  border: 1px solid #e5e7eb; padding: 8px; vertical-align: top; font-size: 13px;
-  white-space: nowrap;
-}
-table.dc2 th { background: #f8fafc; font-weight: 700; text-align: center; }
-table.dc2 td.group { width: 140px; background: #fafafa; font-weight: 800; }
-table.dc2 td.item  { width: 180px; background: #fcfcfc; font-weight: 700; }
-.red { color: #dc2626; font-weight: 800; }
-</style>
-"""
-
-    r1 = ["<tr><th rowspan='2'>Group</th><th rowspan='2'>Item</th>"]
-    r2 = ["<tr>"]
-    for doc_key, doc_label in DOCS:
-        cols = blocks[doc_key]["cols"]
-        r1.append(f"<th colspan='{len(cols)}'>{html_escape(doc_label)}</th>")
-        for c in cols:
-            r2.append(f"<th>{html_escape(c)}</th>")
-    r1.append("</tr>")
-    r2.append("</tr>")
-
-    def td(flag_key: Tuple[str, str, str], value: str) -> str:
-        is_red = cargo_flags.get(flag_key, False)
-        cls = "red" if is_red else ""
-        return f'<td class="{cls}">{html_escape(value)}</td>'
-
-    rows_html = []
-
-    # Cargo name
-    rows_html.append("<tr>")
-    rows_html.append('<td class="group"></td>')
-    rows_html.append('<td class="item">Cargo name</td>')
-    for doc_key, _ in DOCS:
-        cols = blocks[doc_key]["cols"]
-        for c in cols:
-            val = blocks[doc_key]["cargo_name"] if c == "Brand" else ""
-            rows_html.append(td(("CargoName", doc_key, c), val))
-    rows_html.append("</tr>")
-
-    # HS
-    rows_html.append("<tr>")
-    rows_html.append('<td class="group"></td>')
-    rows_html.append('<td class="item">HS code / pos tarif</td>')
-    for doc_key, _ in DOCS:
-        cols = blocks[doc_key]["cols"]
-        for c in cols:
-            val = blocks[doc_key]["hs"] if c == "Brand" else ""
-            key = ("HS", doc_key, "Brand") if c == "Brand" else ("HSx", doc_key, c)
-            rows_html.append(td(key, val))
-    rows_html.append("</tr>")
-
-    # Cargo detail (merge ONLY group column)
-    for i in range(CARGO_LINE_COUNT):
-        rows_html.append("<tr>")
-        if i == 0:
-            rows_html.append(f'<td class="group" rowspan="{CARGO_LINE_COUNT}">Cargo detail</td>')
-        rows_html.append(f'<td class="item">Line {i+1}</td>')
-        for doc_key, _ in DOCS:
-            cargo = blocks[doc_key]["cargo"]
-            cols = blocks[doc_key]["cols"]
-            for c in cols:
-                val = line_cell_value(doc_key, cargo, i, c)
-                rows_html.append(td((f"Line{i+1}", doc_key, c), val))
-        rows_html.append("</tr>")
-
-    # Measurement
-    rows_html.append("<tr>")
-    rows_html.append('<td class="group"></td>')
-    rows_html.append('<td class="item">Measurement (CBM)</td>')
-    for doc_key, _ in DOCS:
-        cols = blocks[doc_key]["cols"]
-        for c in cols:
-            val = blocks[doc_key]["measurement"] if c == "Brand" else ""
-            rows_html.append(td(("CBM", doc_key, c), val))
-    rows_html.append("</tr>")
-
-    # Total
-    rows_html.append("<tr>")
-    rows_html.append('<td class="group"></td>')
-    rows_html.append('<td class="item">Total</td>')
-    for doc_key, _ in DOCS:
-        cols = blocks[doc_key]["cols"]
-        for c in cols:
-            val = norm_spaces(str(blocks[doc_key]["total_row"].get(c, "")))
-            rows_html.append(td(("Total", doc_key, c), val))
-    rows_html.append("</tr>")
-
-    # Total check
-    rows_html.append("<tr>")
-    rows_html.append('<td class="group"></td>')
-    rows_html.append('<td class="item">Total check</td>')
-    for doc_key, _ in DOCS:
-        cols = blocks[doc_key]["cols"]
-        for c in cols:
-            val = norm_spaces(str(blocks[doc_key]["check_row"].get(c, "")))
-            rows_html.append(td(("Check", doc_key, c), val))
-    rows_html.append("</tr>")
-
-    html = "\n".join(
-        [css, '<div class="scrollx">', '<table class="dc2">', "<thead>", "".join(r1), "".join(r2), "</thead>", "<tbody>"]
-        + rows_html
-        + ["</tbody></table></div>"]
-    )
-    return html
-
-
 # =========================
 # UI
 # =========================
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
-st.caption("Single upload (multiple PDFs) → auto-detect BL/Invoice/Packing/BC 1.6 → extract & compare. Horizontal scroll for readability.")
+st.caption(
+    "Single upload (multiple PDFs) → auto-detect BL/Invoice/Packing/BC 1.6 → extract & compare. "
+    "Cargo Information is now Cargo Summary (8 fields). "
+    "Line items extraction remains for internal calculation."
+)
 
 top_left, top_right = st.columns([3.5, 1.5], gap="small")
 
@@ -1125,34 +1023,23 @@ if run:
                     except Exception as e:
                         errors.append(f"[{doc_label}] {type(e).__name__}: {str(e)[:200]}")
 
-# Build views (always show tables even if no uploads)
+# Shipment view
 ship_headers, ship_rows = build_shipment_matrix(extracted)
 ship_flags = compute_shipment_mismatch_flags(ship_rows)
 
-cargo_blocks = build_cargo_blocks(extracted)
-
-# TIP rule needs Shipment(Bc1.6) shipper/cargo_owner
-bc16_shipper = ""
-bc16_cargo_owner = ""
-try:
-    bc16_shipper = norm_spaces(str(extracted.get("CUSTOMS_BC16", {}).get("shipment", {}).get("shipper", "")))
-    bc16_cargo_owner = norm_spaces(str(extracted.get("CUSTOMS_BC16", {}).get("shipment", {}).get("cargo_owner", "")))
-except Exception:
-    pass
-
-cargo_flags = compute_cargo_flags(cargo_blocks, bc16_shipper, bc16_cargo_owner)
+# Cargo Summary view (8 fields)
+cargo_headers, cargo_rows = build_cargo_summary_matrix(extracted)
+cargo_flags = compute_cargo_summary_mismatch_flags(cargo_rows)
 
 st.divider()
 k1, k2, k3, k4 = st.columns(4)
 
 docs_uploaded_count = len(uploaded_files) if uploaded_files else 0
 ship_mis_count = sum(1 for (rk, _dl), v in ship_flags.items() if v and rk != "document_number")
+cargo_mis_count = sum(1 for (_rk, _dl), v in cargo_flags.items() if v)
 
 k1.metric("Shipment mismatches", ship_mis_count)
-k2.metric(
-    "HS mismatch (6-digit)",
-    "YES" if any(cargo_flags.get(("HS", dk, "Brand"), False) for dk, _ in DOCS) else "NO",
-)
+k2.metric("Cargo summary mismatches", cargo_mis_count)
 k3.metric("PDF files uploaded", docs_uploaded_count)
 k4.metric("Extraction errors", len(errors))
 
@@ -1162,10 +1049,10 @@ if errors:
             st.error(e)
 
 st.subheader("Shipment Information")
-st.markdown(render_shipment_html(ship_headers, ship_rows, ship_flags), unsafe_allow_html=True)
+st.markdown(render_simple_compare_html(ship_headers, ship_rows, ship_flags), unsafe_allow_html=True)
 
-st.subheader("Cargo Information")
-st.markdown(render_cargo_html(cargo_blocks, cargo_flags), unsafe_allow_html=True)
+st.subheader("Cargo Information (Summary)")
+st.markdown(render_simple_compare_html(cargo_headers, cargo_rows, cargo_flags), unsafe_allow_html=True)
 
 st.divider()
 st.caption(
@@ -1174,10 +1061,10 @@ st.caption(
     "POL compares city only. POD compares city only and treats Jakarta as Tanjung Priok. "
     "Vessel/Voy ignores punctuation; KMTC HOCHIMINH + 2510S is treated as equivalent. "
     "Container type/amount shows quantity only (container number => 1); value '0' is displayed as blank. "
-    "HS comparison ignores punctuation and matches first 6 digits. "
-    "KG is converted to MT. "
-    "Total row shows document totals as-is. "
-    "Total check compares sum(line items) vs document totals; ok=black, no=red. "
-    "Cargo line (Line1~5) cell mismatch is highlighted in red. "
-    "TIP in Customs BC 1.6 Code is highlighted red ONLY when (BC1.6 Cargo owner == BC1.6 Shipper) and Cargo owner is not blank."
+    "Cargo Summary compare: empty values ignored; compare only when 2+ values exist; "
+    "Cargo name uses strict text normalization (lower + symbol/extra spaces removed); "
+    "HS compares first 6 digits (numbers only); "
+    "Packing type normalizes plural (bundles=bundle, pcs=pc); "
+    "Totals (bundles/pcs) compare as integers; "
+    "Gross/Net/CBM compare after unit normalization and rounding to 3 decimals."
 )
