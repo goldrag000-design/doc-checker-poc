@@ -1197,13 +1197,13 @@ with col_logo:
 with col_title:
     st.markdown(
         f"""
-        <div style="line-height:1.1; margin-top:0.1rem;">
-          <div style="font-size:2.0rem; font-weight:800; margin:0;">
+        <div style="line-height:1.15; margin-top:0.2rem;">
+          <span style="font-size:2.0rem; font-weight:800;">
             {html_escape(APP_TITLE)}
-          </div>
-          <div style="font-size:1.6rem; font-weight:700; color:{SUBTITLE_COLOR}; margin-top:0.15rem;">
+          </span>
+          <span style="font-size:1.6rem; font-weight:700; color:{SUBTITLE_COLOR}; margin-left:0.5rem;">
             {html_escape(SUBTITLE_TEXT)}
-          </div>
+          </span>
         </div>
         """,
         unsafe_allow_html=True,
