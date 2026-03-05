@@ -1182,21 +1182,28 @@ table.dc td.item { width: 240px; background: #fafafa; font-weight: 600; }
 # =========================
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 
-# --- Header layout: logo on top-left, title line below (with blue 80% subtitle in parentheses) ---
-col_logo, col_title = st.columns([1.2, 8.8], vertical_alignment="top")
+# --- Header layout (UPDATED):
+# 1) Logo is larger (approx 5x)
+# 2) Subtitle moved to the next line under the title
+col_logo, col_title = st.columns([2.8, 7.2], vertical_alignment="top")
 
 with col_logo:
     if os.path.exists(LOGO_PATH):
-        st.image(LOGO_PATH, use_container_width=True)
+        # 로고 크게: column 너비도 키우고, width를 강제로 크게
+        st.image(LOGO_PATH, width=520)  # ✅ 필요하면 450~650 사이로 조절
     else:
         st.empty()
 
 with col_title:
     st.markdown(
         f"""
-        <div style="line-height:1.15; margin-top:0.2rem;">
-          <span style="font-size:2.0rem; font-weight:800;">{html_escape(APP_TITLE)}</span>
-          <span style="font-size:1.6rem; font-weight:700; color:{SUBTITLE_COLOR}; margin-left:0.35rem;">{html_escape(SUBTITLE_TEXT)}</span>
+        <div style="line-height:1.1; margin-top:0.1rem;">
+          <div style="font-size:2.0rem; font-weight:800; margin:0;">
+            {html_escape(APP_TITLE)}
+          </div>
+          <div style="font-size:1.6rem; font-weight:700; color:{SUBTITLE_COLOR}; margin-top:0.15rem;">
+            {html_escape(SUBTITLE_TEXT)}
+          </div>
         </div>
         """,
         unsafe_allow_html=True,
