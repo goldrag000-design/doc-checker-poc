@@ -1269,13 +1269,6 @@ errors: List[str] = []
 uploaded_files = None
 run = False
 
-# KPI row (top dashboard)
-k1, k2, k3, k4 = st.columns(4)
-# initialize KPI with current empty state
-k1.metric("Shipment mismatches", 0)
-k2.metric("Cargo summary mismatches", 0)
-k3.metric("PDF files uploaded", 0)
-k4.metric("Extraction errors", 0)
 
 # Upload + Debug row (final layout)
 upload_col, debug_col = st.columns([3.2, 1.0], gap="medium")
