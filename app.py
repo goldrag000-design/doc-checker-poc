@@ -2,6 +2,7 @@ import os
 import re
 import json
 import time
+import csv
 import hashlib
 from typing import Dict, Any, Tuple, List, Optional
 from collections import Counter
@@ -15,7 +16,11 @@ from openai import OpenAI
 # =========================
 # App config
 # =========================
-APP_TITLE = "Doc Checker PoC — Shipment & Cargo Compare (Cargo Summary v2)"
+APP_TITLE = "DOC checker for PLB incoming"
+SUBTITLE_TEXT = "(PoC_ver.1_developed by Brad Ha)"
+SUBTITLE_COLOR = "#1d4ed8"  # blue
+LOGO_PATH = "logo.png"
+
 MODEL = "gpt-4.1-mini"
 
 DOCS = [
@@ -40,7 +45,7 @@ SHIPMENT_ROWS = [
     ("container_40", "Container type / amount (40')"),
 ]
 
-# Cargo Summary 8 fields (UI only)
+# Cargo Summary (UI only): 8 fields + BC 1.6 code row
 CARGO_SUMMARY_ROWS = [
     ("cargo_name", "Cargo name"),
     ("hs6", "HS code (6-digit)"),
@@ -50,10 +55,11 @@ CARGO_SUMMARY_ROWS = [
     ("gross_mt", "Total Gross WT (MT)"),
     ("net_mt", "Total Net WT (MT)"),
     ("measurement_cbm", "Measurement (CBM)"),
+    ("bc16_code", "Customs (BC 1.6) code"),
 ]
 
 MAX_TEXT_CHARS = 12000
-
+HS_RULES_CSV = "hs_rules.csv"
 
 # =========================
 # Secrets / OpenAI client
@@ -91,10 +97,7 @@ def pdf_to_pages_text(file) -> List[str]:
 
 
 def fingerprint_from_inputs(uploaded_files: List, page_assignments: List[Tuple[str, int, str]]) -> str:
-    """
-    KOR:
-    - 업로드 파일 내용 + (파일명/페이지/타입) 배정을 섞어서 캐시용 fingerprint 생성
-    """
+    """KOR: 업로드 파일 내용 + (파일명/페이지/타입) 배정을 섞어서 캐시용 fingerprint 생성"""
     h = hashlib.sha1()
     for f in uploaded_files:
         try:
@@ -196,7 +199,6 @@ def to_mt(value: str) -> str:
         return s
     if "kg" in low:
         x = x / 1000.0
-    # 표시는 3자리까지, 뒤 0 제거
     return f"{x:.3f}".rstrip("0").rstrip(".")
 
 
@@ -277,7 +279,8 @@ def loose_text_key(v: str) -> str:
 def norm_text_strict_key(v: str) -> str:
     """
     KOR:
-    Cargo name 비교용: 소문자 + 기호 제거 + 중복공백 제거 (철자는 느슨하게 처리하지 않음)
+    Cargo name 비교용: 소문자 + 기호 제거 + 중복공백 제거
+    (철자는 느슨하게 처리하지 않음 = 이 정규화 후 문자열이 1글자라도 다르면 mismatch)
     """
     s = norm_spaces(v).lower()
     s = re.sub(r"[^\w\s]", " ", s)
@@ -299,33 +302,26 @@ def packing_type_key(v: str) -> str:
     s = re.sub(r"[^\w\s]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
 
-    # 단순 통일 (과도 확장 금지)
     if s in ("bundles", "bundle"):
         return "bundle"
     if s in ("pcs", "pc", "piece", "pieces"):
         return "pc"
 
-    # 흔한 변형: "bundle(s)"처럼 괄호
     s = s.replace("bundles", "bundle")
     s = s.replace("pcs", "pc")
     s = s.replace("pieces", "pc")
     s = s.replace("piece", "pc")
 
-    # 마지막으로 단어 하나만 남기기 (packing type은 보통 단어 1~2개)
     toks = s.split()
     if len(toks) == 0:
         return ""
     if len(toks) == 1:
         return toks[0]
-    # "big bag" 같은 경우는 2단어 유지
     return " ".join(toks[:2])
 
 
 def int_only_str(v: str) -> str:
-    """
-    KOR:
-    Total bundles/pcs 비교용: 숫자만 추출하여 정수로 표시
-    """
+    """KOR: 숫자만 추출하여 정수로 표시"""
     f = to_float(v)
     if f is None:
         return ""
@@ -333,10 +329,7 @@ def int_only_str(v: str) -> str:
 
 
 def cbm_key(v: str) -> str:
-    """
-    KOR:
-    CBM 비교: 숫자 비교 + 소수점 셋째자리 반올림(표준화)
-    """
+    """KOR: CBM 비교: 숫자 비교 + 소수점 셋째자리 반올림(표준화)"""
     f = to_float(v)
     if f is None:
         return ""
@@ -344,11 +337,7 @@ def cbm_key(v: str) -> str:
 
 
 def mt_key(v: str) -> str:
-    """
-    KOR:
-    MT 비교: KG면 /1000 후, 소수점 셋째자리 반올림(표준화)
-    """
-    # to_mt는 문자열 표준화(표시 목적)라서, 비교는 float 기반으로 다시 계산
+    """KOR: MT 비교: KG면 /1000 후, 소수점 셋째자리 반올림(표준화)"""
     s = norm_spaces(v)
     if not s:
         return ""
@@ -403,8 +392,7 @@ def classify_page(text: str) -> Optional[str]:
     if "packing list" in t:
         return "PACKING_LIST"
 
-    # --- Invoice ---
-    # 오타 대응 포함: "nvoice" 등
+    # --- Invoice (typo tolerant: NVOICE) ---
     if "invoice" in t or "nvoice" in t:
         return "PROFORMA_INVOICE"
 
@@ -495,36 +483,35 @@ General rules:
 - If not found, use "".
 - Keep company names and document numbers as-is.
 - Weights: include unit if present (KG or MT).
-- HS code: keep as written (we normalize later).
+- HS code: keep as written (we normalize later to 6-digit).
 - Keep values short.
-"""
 
-    doc_rules = """
 Shipment rules:
-- container_20 and container_40 MUST be quantity ONLY (a number). If only a container number is shown, use 1.
+- container_20 and container_40 MUST be quantity ONLY (a number).
+- If only a container number is shown, use 1.
 """
 
     if doc_key == "CUSTOMS_BC16":
-        doc_rules += """
+        doc_rules = """
 Document-specific rules (Customs BC 1.6):
 - Source text is Indonesian; translate extracted values into English (company names stay as-is).
 - IMPORTANT: cargo.totals.gross_wt must be the value from 'Berat Kotor' (usually item 31).
-- For BC 1.6 line_items: gross_wt can be blank; net_wt and amount/code per line are OK.
+- For BC 1.6 line_items: fill hs_code per line if present; also fill line_items[].code with the value shown as 'Kode: TIP' or 'Kode: KON' (only TIP/KON).
 - If a container field is not applicable, return "" (do NOT force 0).
 """
     elif doc_key == "PROFORMA_INVOICE":
-        doc_rules += """
+        doc_rules = """
 Document-specific rules (Invoice):
 - If the document shows a single weight per brand/line (e.g., "WT"), treat it as NET WT.
   Put it into line_items[].net_wt (NOT gross_wt).
 """
     elif doc_key == "BL_SWB":
-        doc_rules += """
+        doc_rules = """
 Document-specific rules (BL/SWB):
 - Extract measurement_cbm if shown (Measurement/CBM).
 """
     else:
-        doc_rules += """
+        doc_rules = """
 Document-specific rules (Packing List):
 - Extract per line qty/gross/net if present.
 """
@@ -614,6 +601,7 @@ def build_shipment_matrix(extracted: Dict[str, Any]) -> Tuple[List[str], List[Tu
 def compute_shipment_mismatch_flags(rows) -> Dict[Tuple[str, str], bool]:
     flags = {}
     for row_key, _, row_map in rows:
+        # Document number differences do NOT trigger red highlight
         if row_key == "document_number":
             for _, doc_label in DOCS:
                 flags[(row_key, doc_label)] = False
@@ -664,21 +652,14 @@ def get_line_items(cargo: dict) -> List[dict]:
 
 
 def invoice_net_rule(gross: Optional[float], net: Optional[float]) -> Tuple[Optional[float], Optional[float]]:
-    """
-    Invoice rule:
-    - If only one weight exists per line and it is placed in gross, treat it as net.
-    """
+    """Invoice rule: If only gross exists per line, treat it as net."""
     if gross is not None and net is None:
         return None, gross
     return gross, net
 
 
 def sum_qty_by_packing(line_items: List[dict], target_pack_key: str) -> Optional[float]:
-    """
-    KOR:
-    - packing_type_key(packing) == target_pack_key 인 라인만 qty 합산
-    - qty가 숫자형으로 파싱될 때만 합산
-    """
+    """KOR: packing_type_key(packing) == target_pack_key 인 라인만 qty 합산"""
     s = 0.0
     has = False
     for it in line_items:
@@ -709,13 +690,11 @@ def sum_weights_from_lines(doc_key: str, line_items: List[dict]) -> Tuple[Option
         g_raw = str(it.get("gross_wt", ""))
         n_raw = str(it.get("net_wt", ""))
 
-        # parse gross
         g_num = None
         if norm_spaces(g_raw):
             gk = mt_key(g_raw)
             g_num = to_float(gk) if gk else None
 
-        # parse net
         n_num = None
         if norm_spaces(n_raw):
             nk = mt_key(n_raw)
@@ -735,10 +714,7 @@ def sum_weights_from_lines(doc_key: str, line_items: List[dict]) -> Tuple[Option
 
 
 def dominant_packing_type(line_items: List[dict]) -> str:
-    """
-    KOR:
-    - packing type 후보를 normalize해서 가장 많이 나온 값을 선택
-    """
+    """KOR: packing type 후보를 normalize해서 가장 많이 나온 값을 선택"""
     keys = []
     for it in line_items:
         pk = packing_type_key(str(it.get("packing", "")))
@@ -748,6 +724,23 @@ def dominant_packing_type(line_items: List[dict]) -> str:
         return ""
     c = Counter(keys)
     return c.most_common(1)[0][0]
+
+
+def dominant_bc16_code(line_items: List[dict]) -> str:
+    """
+    KOR:
+    - BC 1.6 line_items[].code 에서 TIP/KON을 수집
+    - 가장 많이 나온 값을 선택
+    - TIP/KON 외 값은 무시
+    """
+    keys = []
+    for it in line_items:
+        c = norm_spaces(str(it.get("code", ""))).upper()
+        if c in ("TIP", "KON"):
+            keys.append(c)
+    if not keys:
+        return ""
+    return Counter(keys).most_common(1)[0][0]
 
 
 def build_cargo_summary_matrix(extracted: Dict[str, Any]) -> Tuple[List[str], List[Tuple[str, str, Dict[str, str]]]]:
@@ -775,7 +768,6 @@ def build_cargo_summary_matrix(extracted: Dict[str, Any]) -> Tuple[List[str], Li
             if doc_key != "BL_SWB":
                 meas = ""
 
-            # totals(문서 내 totals) - 있으면 활용, 없으면 line_items로 보정
             totals = cargo.get("totals", {}) if isinstance(cargo, dict) else {}
             totals = totals if isinstance(totals, dict) else {}
 
@@ -787,15 +779,18 @@ def build_cargo_summary_matrix(extracted: Dict[str, Any]) -> Tuple[List[str], Li
             pack_dom = dominant_packing_type(line_items)  # normalized key
             pack_disp = pack_dom.upper() if pack_dom else ""
 
+            # BC 1.6 code (TIP/KON) — only show on BC 1.6 column
+            bc16_code = dominant_bc16_code(line_items) if doc_key == "CUSTOMS_BC16" else ""
+
             # total bundles / pcs (line_items 기반)
             bundles_sum = sum_qty_by_packing(line_items, "bundle")
             pcs_sum = sum_qty_by_packing(line_items, "pc")
 
-            # 보조: line_items에서 못구하면 totals.qty라도 표시 (단위 구분이 안되므로 bundles에만 fallback)
             bundles_disp = ""
             if bundles_sum is not None:
                 bundles_disp = str(int(round(bundles_sum)))
             elif totals_qty_raw:
+                # (fallback) totals.qty는 단위가 섞일 수 있으므로 bundles에만 한정해서 보조 표시
                 bundles_disp = int_only_str(totals_qty_raw)
 
             pcs_disp = ""
@@ -817,13 +812,13 @@ def build_cargo_summary_matrix(extracted: Dict[str, Any]) -> Tuple[List[str], Li
                 gross_disp = round3_str(g_sum) if g_sum is not None and doc_key != "PROFORMA_INVOICE" else ""
                 net_disp = round3_str(n_sum) if n_sum is not None else ""
 
-            # measurement display: 숫자만 표시 (원본이 'xx CBM'이면 숫자만 보이게)
+            # measurement display: 숫자만 표시
             meas_disp = ""
             if meas:
                 f = to_float(meas)
                 meas_disp = round3_str(f) if f is not None else meas
 
-            # HS display: 원문 유지(표시), 비교는 hs6로
+            # Row selection
             if row_key == "cargo_name":
                 val = cargo_name
             elif row_key == "hs6":
@@ -840,6 +835,8 @@ def build_cargo_summary_matrix(extracted: Dict[str, Any]) -> Tuple[List[str], Li
                 val = net_disp
             elif row_key == "measurement_cbm":
                 val = meas_disp
+            elif row_key == "bc16_code":
+                val = bc16_code if doc_key == "CUSTOMS_BC16" else ""
             else:
                 val = ""
 
@@ -879,19 +876,69 @@ def cargo_value_for_compare(row_key: str, display_value: str) -> str:
     if row_key == "measurement_cbm":
         return cbm_key(v)
 
+    if row_key == "bc16_code":
+        # This row is NOT a cross-doc mismatch; it is a conditional rule based on shipper vs cargo owner.
+        return ""
+
     return norm_text_strict_key(v)
 
 
-def compute_cargo_summary_mismatch_flags(rows: List[Tuple[str, str, Dict[str, str]]]) -> Dict[Tuple[str, str], bool]:
+def compute_bc16_party_same(extracted: Dict[str, Any]) -> Tuple[bool, str, str]:
     """
-    Same principle as Shipment:
+    Returns:
+    - same_party (bool): shipper == cargo_owner (normalized)
+    - shipper_raw, owner_raw
+    """
+    bc16 = extracted.get("CUSTOMS_BC16", {}) if isinstance(extracted, dict) else {}
+    ship = bc16.get("shipment", {}) if isinstance(bc16, dict) else {}
+    shipper = norm_spaces(str(ship.get("shipper", "")))
+    owner = norm_spaces(str(ship.get("cargo_owner", "")))
+
+    sk = loose_text_key(shipper)
+    ok = loose_text_key(owner)
+    same = bool(sk) and (sk == ok)
+    return same, shipper, owner
+
+
+def compute_cargo_summary_mismatch_flags(
+    rows: List[Tuple[str, str, Dict[str, str]]],
+    extracted: Dict[str, Any],
+) -> Dict[Tuple[str, str], bool]:
+    """
+    Same principle as Shipment for normal rows:
     - 빈 값 제외
     - 값 2개 이상일 때만 비교
     - 다르면 해당 셀 red
+
+    Special:
+    - bc16_code row color is determined by TIP/KON + (shipper == cargo owner) rule.
     """
     flags: Dict[Tuple[str, str], bool] = {}
+    bc16_same, _, _ = compute_bc16_party_same(extracted)
+
+    # label lookup
+    bc16_label = dict(DOCS).get("CUSTOMS_BC16", "Customs BC 1.6")
 
     for row_key, _row_label, row_map in rows:
+        # Special conditional rule row
+        if row_key == "bc16_code":
+            # default black for all
+            for _, doc_label in DOCS:
+                flags[(row_key, doc_label)] = False
+
+            code_disp = norm_spaces(row_map.get(bc16_label, "")).upper()
+
+            if code_disp == "TIP":
+                # TIP: same => red, different => black
+                flags[(row_key, bc16_label)] = bool(code_disp) and bc16_same
+            elif code_disp == "KON":
+                # KON: same => black, different => red
+                flags[(row_key, bc16_label)] = bool(code_disp) and (not bc16_same)
+            else:
+                flags[(row_key, bc16_label)] = False
+
+            continue
+
         comps = []
         for _, doc_label in DOCS:
             comps.append(cargo_value_for_compare(row_key, row_map.get(doc_label, "")))
@@ -916,7 +963,175 @@ def compute_cargo_summary_mismatch_flags(rows: List[Tuple[str, str, Dict[str, st
 
 
 # =========================
-# HTML rendering (horizontal + scroll)
+# HS Rules Lookup (hs_rules.csv)
+# =========================
+@st.cache_data(show_spinner=False)
+def load_hs_rules(path: str) -> Dict[str, Dict[str, str]]:
+    """
+    Returns dict: hs6 -> { duty, vat_wht, restriction_import, restriction_export }
+    """
+    rules: Dict[str, Dict[str, str]] = {}
+    if not os.path.exists(path):
+        return rules
+
+    # Try utf-8-sig first for Excel-exported CSV
+    for enc in ("utf-8-sig", "utf-8", "cp1252"):
+        try:
+            with open(path, "r", encoding=enc, newline="") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    hs = hs6(str(row.get("hs6", "") or row.get("HS Code", "") or ""))
+                    if not hs:
+                        continue
+                    rules[hs] = {
+                        "duty": norm_spaces(str(row.get("duty", "") or row.get("Duty", "") or "")),
+                        "vat_wht": norm_spaces(str(row.get("vat_wht", "") or row.get("VAT/WHT", "") or "")),
+                        "restriction_import": norm_spaces(str(row.get("restriction_import", "") or row.get("Restriction (import)", "") or "")),
+                        "restriction_export": norm_spaces(str(row.get("restriction_export", "") or row.get("Restriction (export)", "") or "")),
+                    }
+            return rules
+        except Exception:
+            continue
+
+    return rules
+
+
+def build_tariff_rows_from_cargo_summary(
+    cargo_rows: List[Tuple[str, str, Dict[str, str]]],
+    hs_rules: Dict[str, Dict[str, str]],
+) -> Tuple[bool, List[Dict[str, str]]]:
+    """
+    Policy:
+    - If HS codes (non-empty) are all same => 1 row
+    - If mismatch => per-document row (for docs with HS value)
+    Returns:
+    - is_single_row (bool)
+    - rows: list of dicts with keys: document(optional), hs6, duty, vat_wht, restriction_import, restriction_export, status
+    """
+    hs_row_map: Dict[str, str] = {}
+    for row_key, _label, row_map in cargo_rows:
+        if row_key == "hs6":
+            hs_row_map = row_map
+            break
+
+    # Collect per doc hs6
+    doc_hs: List[Tuple[str, str]] = []  # (doc_label, hs6_value)
+    for _, doc_label in DOCS:
+        raw = norm_spaces(hs_row_map.get(doc_label, ""))
+        h = hs6(raw)
+        if h:
+            doc_hs.append((doc_label, h))
+
+    if not doc_hs:
+        return True, []
+
+    distinct = sorted({h for _, h in doc_hs})
+    is_single = len(distinct) == 1
+
+    def lookup(h: str) -> Dict[str, str]:
+        r = hs_rules.get(h, {})
+        if not r:
+            return {
+                "duty": "",
+                "vat_wht": "",
+                "restriction_import": "",
+                "restriction_export": "",
+                "status": "NOT_FOUND",
+            }
+        return {
+            "duty": r.get("duty", ""),
+            "vat_wht": r.get("vat_wht", ""),
+            "restriction_import": r.get("restriction_import", ""),
+            "restriction_export": r.get("restriction_export", ""),
+            "status": "OK",
+        }
+
+    out: List[Dict[str, str]] = []
+    if is_single:
+        h = distinct[0]
+        r = lookup(h)
+        out.append(
+            {
+                "document": "All documents",
+                "hs6": h,
+                "duty": r["duty"],
+                "vat_wht": r["vat_wht"],
+                "restriction_import": r["restriction_import"],
+                "restriction_export": r["restriction_export"],
+                "status": r["status"],
+            }
+        )
+        return True, out
+
+    # mismatch => per-doc row
+    for doc_label, h in doc_hs:
+        r = lookup(h)
+        out.append(
+            {
+                "document": doc_label,
+                "hs6": h,
+                "duty": r["duty"],
+                "vat_wht": r["vat_wht"],
+                "restriction_import": r["restriction_import"],
+                "restriction_export": r["restriction_export"],
+                "status": r["status"],
+            }
+        )
+    return False, out
+
+
+def render_tariff_table_html(is_single: bool, rows: List[Dict[str, str]]) -> str:
+    css = """
+<style>
+.tariff-wrap { overflow-x: auto; width: 100%; }
+table.tariff { border-collapse: collapse; width: max-content; min-width: 100%; }
+table.tariff th, table.tariff td {
+  border: 1px solid #e5e7eb; padding: 8px; vertical-align: top; font-size: 13px;
+}
+table.tariff th { background: #f8fafc; font-weight: 600; white-space: nowrap; }
+.muted { color: #6b7280; }
+.warn { color: #b45309; font-weight: 700; }
+</style>
+"""
+    if not rows:
+        return css + "<div class='muted'>No HS code (6-digit) found in Cargo Summary.</div>"
+
+    # headers
+    cols = ["HS Code", "Duty", "VAT / WHT", "Restriction (import)", "Restriction (export)"]
+    if not is_single:
+        cols = ["Document"] + cols
+
+    h = [css, "<div class='tariff-wrap'>", "<table class='tariff'>", "<thead><tr>"]
+    for c in cols:
+        h.append(f"<th>{html_escape(c)}</th>")
+    h.append("</tr></thead><tbody>")
+
+    for r in rows:
+        h.append("<tr>")
+        if not is_single:
+            h.append(f"<td>{html_escape(r.get('document',''))}</td>")
+        h.append(f"<td>{html_escape(r.get('hs6',''))}</td>")
+
+        status = r.get("status", "OK")
+        if status == "NOT_FOUND":
+            h.append("<td class='warn'>Not found</td>")
+            h.append("<td class='warn'>Not found</td>")
+            h.append("<td class='warn'>Not found</td>")
+            h.append("<td class='warn'>Not found</td>")
+        else:
+            h.append(f"<td>{html_escape(r.get('duty',''))}</td>")
+            h.append(f"<td>{html_escape(r.get('vat_wht',''))}</td>")
+            h.append(f"<td>{html_escape(r.get('restriction_import',''))}</td>")
+            h.append(f"<td>{html_escape(r.get('restriction_export',''))}</td>")
+
+        h.append("</tr>")
+
+    h.append("</tbody></table></div>")
+    return "\n".join(h)
+
+
+# =========================
+# HTML rendering (shared)
 # =========================
 def html_escape(s: str) -> str:
     return (
@@ -940,7 +1155,7 @@ table.dc th, table.dc td {
 }
 table.dc th { background: #f8fafc; font-weight: 600; }
 table.dc td.item { width: 240px; background: #fafafa; font-weight: 600; }
-.red { color: #dc2626; font-weight: 700; }
+.red { color: #dc2626; font-weight: 800; }
 </style>
 """
     h = [css, '<div class="scrollx">', '<table class="dc">', "<thead><tr>"]
@@ -966,11 +1181,30 @@ table.dc td.item { width: 240px; background: #fafafa; font-weight: 600; }
 # UI
 # =========================
 st.set_page_config(page_title=APP_TITLE, layout="wide")
-st.title(APP_TITLE)
+
+# --- Header layout: logo on top-left, title line below (with blue 80% subtitle in parentheses) ---
+col_logo, col_title = st.columns([1.2, 8.8], vertical_alignment="top")
+
+with col_logo:
+    if os.path.exists(LOGO_PATH):
+        st.image(LOGO_PATH, use_container_width=True)
+    else:
+        st.empty()
+
+with col_title:
+    st.markdown(
+        f"""
+        <div style="line-height:1.15; margin-top:0.2rem;">
+          <span style="font-size:2.0rem; font-weight:800;">{html_escape(APP_TITLE)}</span>
+          <span style="font-size:1.6rem; font-weight:700; color:{SUBTITLE_COLOR}; margin-left:0.35rem;">{html_escape(SUBTITLE_TEXT)}</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
 st.caption(
-    "Single upload (multiple PDFs) → auto-detect BL/Invoice/Packing/BC 1.6 → extract & compare. "
-    "Cargo Information is now Cargo Summary (8 fields). "
-    "Line items extraction remains for internal calculation."
+    "Upload PDFs (merged OK) → auto-detect BL/Invoice/Packing/BC 1.6 → extract & compare. "
+    "Cargo Information is Cargo Summary (8 fields) + BC 1.6 code."
 )
 
 top_left, top_right = st.columns([3.5, 1.5], gap="small")
@@ -980,6 +1214,7 @@ with top_left:
         key = get_api_key()
         st.write("API key loaded:", "✅ Yes" if key.startswith("sk-") else "❌ No (OPENAI_API_KEY missing)")
         st.write("Model:", MODEL)
+        st.write("HS rules file:", HS_RULES_CSV, "✅" if os.path.exists(HS_RULES_CSV) else "❌ Missing")
         st.write("Auto-detect rules:", "BL/SWB, Invoice, Packing List, Customs BC 1.6 (page keywords + continuation)")
 
 with top_right:
@@ -992,11 +1227,9 @@ with top_right:
         )
         run = st.button("Extract & Compare", use_container_width=True)
 
-# Always create extracted dict (even if missing)
-extracted: Dict[str, Any] = {}
+# Default extracted dict (always defined)
+extracted: Dict[str, Any] = {doc_key: {"shipment": {}, "cargo": {}} for doc_key, _ in DOCS}
 errors: List[str] = []
-for doc_key, _ in DOCS:
-    extracted[doc_key] = {"shipment": {}, "cargo": {}}
 
 if run:
     key = get_api_key()
@@ -1023,13 +1256,16 @@ if run:
                     except Exception as e:
                         errors.append(f"[{doc_label}] {type(e).__name__}: {str(e)[:200]}")
 
-# Shipment view
+# Build tables
 ship_headers, ship_rows = build_shipment_matrix(extracted)
 ship_flags = compute_shipment_mismatch_flags(ship_rows)
 
-# Cargo Summary view (8 fields)
 cargo_headers, cargo_rows = build_cargo_summary_matrix(extracted)
-cargo_flags = compute_cargo_summary_mismatch_flags(cargo_rows)
+cargo_flags = compute_cargo_summary_mismatch_flags(cargo_rows, extracted)
+
+# HS tariff lookup (Option A UI below cargo summary; mismatch policy: per-doc rows)
+hs_rules = load_hs_rules(HS_RULES_CSV)
+tariff_is_single, tariff_rows = build_tariff_rows_from_cargo_summary(cargo_rows, hs_rules)
 
 st.divider()
 k1, k2, k3, k4 = st.columns(4)
@@ -1054,6 +1290,12 @@ st.markdown(render_simple_compare_html(ship_headers, ship_rows, ship_flags), uns
 st.subheader("Cargo Information (Summary)")
 st.markdown(render_simple_compare_html(cargo_headers, cargo_rows, cargo_flags), unsafe_allow_html=True)
 
+st.subheader("Tariff & Restrictions (from HS 6-digit)")
+if not os.path.exists(HS_RULES_CSV):
+    st.warning(f"Missing lookup file: {HS_RULES_CSV}. Place it in the project folder.")
+else:
+    st.markdown(render_tariff_table_html(tariff_is_single, tariff_rows), unsafe_allow_html=True)
+
 st.divider()
 st.caption(
     "Rules applied: Doc number mismatch ignored. "
@@ -1066,5 +1308,7 @@ st.caption(
     "HS compares first 6 digits (numbers only); "
     "Packing type normalizes plural (bundles=bundle, pcs=pc); "
     "Totals (bundles/pcs) compare as integers; "
-    "Gross/Net/CBM compare after unit normalization and rounding to 3 decimals."
+    "Gross/Net/CBM compare after unit normalization and rounding to 3 decimals. "
+    "Customs (BC 1.6) code: show TIP/KON only on BC 1.6 column; "
+    "TIP is red when Shipper == Cargo owner; KON is red when Shipper != Cargo owner."
 )

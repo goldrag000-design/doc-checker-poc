@@ -1,0 +1,29 @@
+HS Code;Duty;VAT / WHT;Restriction (import);Restriction (export)
+740311;5%;12% / 2.5%;;LS (Surveyor Report) > 99.9%
+760110;0%;12% / 2.5%;;
+760120;0%;12% / 2.5%;;
+750210;5%;12% / 2.5%;;LS (Surveyor Report) >93%
+750220;5%;12% / 2.5%;;LS (Surveyor Report)
+790111;0%;12% / 2.5%;;LS (Surveyor Report) > 99.9%
+790120;5%;12% / 2.5%;;LS (Surveyor Report)
+780110;5%;12% / 2.5%;B3 (DG & toxic);LS (Surveyor Report) >90%
+800110;5%;12% / 2.5%;;ET, PE, LS
+810520;5%;12% / 2.5%;;LS (Surveyor Report)
+740400;0%;12% / 2.5%;PI (import permit), LS (Surveyor report);PE (Export permit)
+760200;0%;12% / 2.5%;PI (import permit), LS (Surveyor report);PE (Export permit)
+750300;0%;12% / 2.5%;PI (import permit), LS (Surveyor report);PE (Export permit)
+790200;0%;12% / 2.5%;PI (import permit), LS (Surveyor report);PE (Export permit)
+780200;0%;12% / 2.5%;Not permitted;
+720421;0%;12% / 2.5%;PI (import permit), LS (Surveyor report);PE (Export permit)
+260300;0%;12% / 2.5%;;Not permitted
+260400;5%;12% / 2.5%;;Not permitted
+720221;0%;12% / 2.5%;;LS (Surveyor Report), PE (Export permit)
+720211;0%;12% / 2.5%;;LS (Surveyor Report) > 60%
+720260;0%;12% / 2.5%;;Check the details on INSW
+283691;5%;12% / 2.5%;FDA approval;
+282520;5%;12% / 2.5%;;
+283324;5%;12% / 2.5%;;LS (Surveyor Report) >20% Ni
+283329;5%;12% / 2.5%;FDA approval, Import permit, LS;LS (Surveyor Report)
+283329;5%;12% / 2.5%;FDA approval, Import permit, LS;LS (Surveyor Report)
+180100;5%;12% / 2.5%;KT (Quarantine);
+090111;5%;12% / 2.5%;KT (Quarantine);
