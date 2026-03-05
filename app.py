@@ -968,30 +968,92 @@ def compute_cargo_summary_mismatch_flags(
 @st.cache_data(show_spinner=False)
 def load_hs_rules(path: str) -> Dict[str, Dict[str, str]]:
     """
-    Returns dict: hs6 -> { duty, vat_wht, restriction_import, restriction_export }
+    Robust CSV loader:
+    - Auto-detect delimiter: , ; \t |
+    - Normalizes headers (strip/lower)
+    - Works with your headers:
+        HS Code, Duty, VAT / WHT, Restriction (import), Restriction (export)
     """
     rules: Dict[str, Dict[str, str]] = {}
     if not os.path.exists(path):
         return rules
 
-    # Try utf-8-sig first for Excel-exported CSV
+    def digits(x: Any) -> str:
+        return re.sub(r"\D", "", str(x or ""))
+
+    def hs6_from_value(v: Any) -> str:
+        s = digits(v)
+        return s[:6] if len(s) >= 6 else ""
+
+    def norm_header(h: str) -> str:
+        return re.sub(r"\s+", " ", (h or "")).strip().lower()
+
+    def get_by_keys(row: Dict[str, Any], keys: List[str]) -> str:
+        for k in keys:
+            if k in row and row[k] is not None:
+                return str(row[k])
+        return ""
+
+    # Read raw text once
+    raw_text = None
     for enc in ("utf-8-sig", "utf-8", "cp1252"):
         try:
             with open(path, "r", encoding=enc, newline="") as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    hs = hs6(str(row.get("hs6", "") or row.get("HS Code", "") or ""))
-                    if not hs:
-                        continue
-                    rules[hs] = {
-                        "duty": norm_spaces(str(row.get("duty", "") or row.get("Duty", "") or "")),
-                        "vat_wht": norm_spaces(str(row.get("vat_wht", "") or row.get("VAT/WHT", "") or "")),
-                        "restriction_import": norm_spaces(str(row.get("restriction_import", "") or row.get("Restriction (import)", "") or "")),
-                        "restriction_export": norm_spaces(str(row.get("restriction_export", "") or row.get("Restriction (export)", "") or "")),
-                    }
-            return rules
+                raw_text = f.read()
+            break
         except Exception:
             continue
+
+    if not raw_text:
+        return rules
+
+    # Detect delimiter
+    sample = raw_text[:5000]
+    delim = ","
+    try:
+        dialect = csv.Sniffer().sniff(sample, delimiters=[",", ";", "\t", "|"])
+        delim = dialect.delimiter
+    except Exception:
+        first_line = sample.splitlines()[0] if sample.splitlines() else ""
+        counts = {d: first_line.count(d) for d in [",", ";", "\t", "|"]}
+        delim = max(counts, key=counts.get) if counts else ","
+
+    # Parse
+    reader = csv.reader(raw_text.splitlines(), delimiter=delim)
+    rows = list(reader)
+    if not rows:
+        return rules
+
+    headers_raw = rows[0]
+    headers = [norm_header(h) for h in headers_raw]
+
+    for r in rows[1:]:
+        if not any(str(x).strip() for x in r):
+            continue
+        row = {}
+        for i, h in enumerate(headers):
+            row[h] = r[i] if i < len(r) else ""
+
+        hs = hs6_from_value(get_by_keys(row, ["hs6", "hs code", "hs_code", "hs"]))
+        if not hs:
+            joined = " ".join(str(v) for v in row.values())
+            m = re.search(r"\b(\d{6})\b", joined)
+            hs = m.group(1) if m else ""
+        if not hs:
+            continue
+
+        duty = norm_spaces(get_by_keys(row, ["duty"]))
+        vat_wht = norm_spaces(get_by_keys(row, ["vat/wht", "vat / wht", "vat_wht"]))
+
+        r_import = norm_spaces(get_by_keys(row, ["restriction (import)", "restriction import", "restriction"]))
+        r_export = norm_spaces(get_by_keys(row, ["restriction (export)", "restriction export"]))
+
+        rules[hs] = {
+            "duty": duty,
+            "vat_wht": vat_wht,
+            "restriction_import": r_import,
+            "restriction_export": r_export,
+        }
 
     return rules
 
