@@ -304,6 +304,8 @@ def packing_type_key(v: str) -> str:
 
     if s in ("bundles", "bundle"):
         return "bundle"
+    if s in ("bdl", "be", "b/e"):
+    return "bundle"
     if s in ("pcs", "pc", "piece", "pieces"):
         return "pc"
 
